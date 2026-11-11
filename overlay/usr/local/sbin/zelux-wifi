@@ -1,0 +1,114 @@
+#!/bin/bash
+# 命令行配 WiFi（nmcli 的薄包装，只为把"要记的那几个 nmcli 参数"变少）
+#
+# 跑在哪：板子上，SSH / HDMI 里用。普通用户也行（NetworkManager 允许本机会话改网络），
+#         但改系统连接建议 sudo。
+# 会改动什么：只改 NetworkManager 的连接（不改 /etc/zelux/zelux.toml，也不碰热点配置文件）。
+#
+# 用法：
+#   zelux-wifi                       # 现在连的什么、IP 多少、热点开没开
+#   zelux-wifi scan                  # 扫一圈（信号从强到弱）
+#   zelux-wifi connect "家里WiFi"     # 交互输入密码
+#   zelux-wifi connect "家里WiFi" 密码 # 直接给密码（会留在 shell 历史里，不推荐）
+#   zelux-wifi ap on|off             # 手动开关兜底热点 ZELUX-Duck
+#   zelux-wifi forget "家里WiFi"      # 删掉保存的连接（换密码了用这个）
+#   zelux-wifi ip                    # 只打印一个 IPv4
+set -euo pipefail
+
+readonly AP_CONN="zelux-ap"
+
+log() { printf '[zelux-wifi] %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+need_nmcli() {
+    command -v nmcli >/dev/null 2>&1 || die "没有 nmcli：NetworkManager 没装（apt install network-manager）"
+}
+
+show_status() {
+    need_nmcli
+    echo "== 设备 =="
+    nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status || true
+    echo
+    echo "== IPv4 =="
+    ip -4 -o addr show scope global | awk '{printf "%-10s %s\n", $2, $4}' || true
+    echo
+    echo "== 已保存连接 =="
+    nmcli -t -f NAME,TYPE,AUTOCONNECT connection show || true
+    echo
+    if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx "$AP_CONN"; then
+        echo "热点：已开启（SSID ZELUX-Duck / 192.168.4.1）"
+    else
+        echo "热点：未开启（zelux-wifi ap on 可以手动开）"
+    fi
+    local ip
+    ip="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    [ -n "$ip" ] && echo && echo "网页：http://${ip}:8000"
+    return 0
+}
+
+do_scan() {
+    need_nmcli
+    nmcli -f SSID,SIGNAL,SECURITY device wifi list --rescan yes || die "扫描失败（无线网卡被占用？）"
+}
+
+do_connect() {
+    local ssid="${1:-}" pass="${2:-}"
+    [ -n "$ssid" ] || die "用法：zelux-wifi connect <SSID> [密码]"
+    need_nmcli
+    if [ -z "$pass" ]; then
+        # -s 不回显：密码不该出现在屏幕和滚动缓冲里
+        printf '密码（开放网络直接回车）：' >&2
+        read -rs pass || true
+        printf '\n' >&2
+    fi
+    if [ -z "$pass" ]; then
+        nmcli device wifi connect "$ssid" || die "连不上（开放网络/信号太弱/密码错？）"
+    else
+        nmcli device wifi connect "$ssid" password "$pass" || die "连不上（密码错？）"
+    fi
+    sleep 2
+    local ip
+    ip="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    if [ -n "$ip" ]; then
+        log "已连接，网页：http://${ip}:8000"
+    else
+        log "已提交连接，但还没拿到 IP：再等几秒，或 zelux-wifi（看状态）"
+    fi
+}
+
+do_ap() {
+    local on="${1:-}"
+    need_nmcli
+    case "$on" in
+        on)
+            nmcli connection reload 2>/dev/null || true
+            nmcli connection up "$AP_CONN" || die "热点起不来（装了 dnsmasq-base 吗？）"
+            sleep 2
+            log "热点已开：SSID ZELUX-Duck（密码 zeluxduck），手机连上后开 http://192.168.4.1:8000"
+            ;;
+        off)
+            nmcli connection down "$AP_CONN" 2>/dev/null || true
+            log "热点已关"
+            ;;
+        *) die "用法：zelux-wifi ap on|off" ;;
+    esac
+}
+
+do_forget() {
+    local ssid="${1:-}"
+    [ -n "$ssid" ] || die "用法：zelux-wifi forget <SSID>"
+    need_nmcli
+    nmcli connection delete "$ssid" || die "没有这个连接：$ssid"
+    log "已删除 $ssid"
+}
+
+case "${1:-status}" in
+    status|"") show_status ;;
+    scan) do_scan ;;
+    connect) shift; do_connect "${1:-}" "${2:-}" ;;
+    ap) shift; do_ap "${1:-}" ;;
+    forget) shift; do_forget "${1:-}" ;;
+    ip) ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1 ;;
+    -h|--help) sed -n '2,18p' "$0" ;;
+    *) die "不认识的命令：$1（status/scan/connect/ap/forget/ip）" ;;
+esac

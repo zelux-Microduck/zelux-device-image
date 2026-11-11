@@ -1,0 +1,31 @@
+# ZELUX 兜底热点：没有任何已知 WiFi 时给手机一个入口
+#
+# 只在首次开机（或用户手动 `nmcli connection up zelux-ap`）时起，
+# 所以 autoconnect=false —— 平时绝不抢 wlan0，否则家里 WiFi 永远连不上。
+#
+# 权限必须是 0600 root:root，否则 NetworkManager 会拒绝加载整个文件（连"热点为什么没起来"都看不到）。
+
+[connection]
+id=zelux-ap
+uuid=d0aa6fc7-e5ce-47a7-81bb-f9ea839f7ae6
+type=wifi
+autoconnect=false
+autoconnect-priority=0
+# 热点模式下不跑 IPv6，手机连上来不会卡在"正在获取 IP"
+ipv6.method=ignore
+
+[wifi]
+mode=ap
+ssid=ZELUX-Duck
+# 2.4 GHz + 6 信道：兼容性最好，也不会和常见的 5 GHz 路由打架
+band=bg
+channel=6
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=zeluxduck
+
+[ipv4]
+# shared = NM 自己开 DHCP + DNS（依赖 dnsmasq-base，镜像里已尽量带上）
+method=shared
+address1=192.168.4.1/24

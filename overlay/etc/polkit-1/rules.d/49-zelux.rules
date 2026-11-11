@@ -1,0 +1,18 @@
+// ZELUX：只放开"重启 / 关机"两件事，别的一律不给
+// 为什么需要：zeluxd 以 zelux 用户跑，网页上的 sys.op=reboot 走的是 systemctl，
+// 没有这条规则就会因为 polkit 拒绝而静默失败（页面点了没反应，最难查的那种）。
+polkit.addRule(function (action, subject) {
+    if (subject.user !== "zelux") {
+        return null;
+    }
+    var allowed = [
+        "org.freedesktop.login1.reboot",
+        "org.freedesktop.login1.reboot-multiple-sessions",
+        "org.freedesktop.login1.power-off",
+        "org.freedesktop.login1.power-off-multiple-sessions"
+    ];
+    if (allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+    return null;
+});

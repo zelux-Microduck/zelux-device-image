@@ -1,0 +1,26 @@
+[Unit]
+Description=ZELUX first boot provisioning (password / rootfs grow / hostname / WiFi fallback)
+Documentation=file:///opt/zelux/current/software/README.md
+# 只在第一次开机干活；之后再跑就是读一下 /var/lib/zelux/.initialized 立刻退出
+Wants=network-online.target
+After=network-online.target zelux-fand.service
+Before=zeluxd.service
+ConditionPathExists=!/var/lib/zelux/.initialized
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 明确写 root：它要扩分区、改 hostname、写 auth.json
+User=root
+Group=root
+# 串口控制台被舵机总线占了（/dev/ttyS2），所以提示写 /dev/tty1（HDMI）和 journal
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/local/bin/zelux-firstboot
+# 里面最多等 30 秒 WiFi；扩容 32 GB 卡上 resize2fs 也就几十秒，180 秒够宽
+TimeoutStartSec=180
+# 脚本内部每一步都是"失败就记日志继续"，所以正常只会 exit 0；
+# 真 exit 非 0 时不要把整机卡成 emergency，ConditionPathExists 也不会再挡（flag 没写成功）
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=ZELUX staged update apply (switch /opt/zelux/current and restart zeluxd)
+Documentation=file:///opt/zelux/current/software/README.md
+# 手动触发：sudo systemctl start zelux-update
+# 或由 zeluxd 的 ota.op=apply 在通过前置校验后触发（必须 posture=holding 且策略关闭）
+Wants=network-online.target
+After=network-online.target zeluxd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# --apply-staged 是幂等的：没有待安装版本就直接 exit 0
+ExecStart=/usr/local/bin/zelux-update --apply-staged
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+# 升级脚本要写 /opt/zelux 并重启服务，所以是 root；它自己不做任何联网下载
+User=root
+
+[Install]
+WantedBy=multi-user.target

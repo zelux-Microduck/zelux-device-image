@@ -1,0 +1,25 @@
+[Unit]
+Description=ZELUX zeluxd self-heal (one shot)
+
+[Service]
+Type=oneshot
+User=root
+# 看护逻辑短小，直接用 shell 内联，避免多一个脚本文件
+ExecStart=/bin/bash -c '\
+  if ! systemctl is-enabled --quiet zeluxd 2>/dev/null; then exit 0; fi; \
+  if systemctl is-active --quiet zeluxd 2>/dev/null; then exit 0; fi; \
+  st=$(systemctl show -p ActiveState --value zeluxd 2>/dev/null); \
+  rs=$(systemctl show -p RestartPreventExitStatus --value zeluxd 2>/dev/null); \
+  echo "zeluxd 未在运行（state=$st），尝试拉起"; \
+  systemctl start zeluxd 2>&1 || true; \
+  sleep 6; \
+  if systemctl is-active --quiet zeluxd 2>/dev/null; then \
+    echo "已拉起"; \
+    systemctl restart zelux-fand 2>/dev/null || true; \
+  else \
+    echo "仍起不来，最近日志："; \
+    journalctl -u zeluxd -n 15 --no-pager 2>/dev/null || true; \
+  fi'
+
+# 不要因为失败而把整机标记为 degraded
+SuccessExitStatus=0

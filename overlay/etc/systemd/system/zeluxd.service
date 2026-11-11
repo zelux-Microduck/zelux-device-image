@@ -1,0 +1,47 @@
+[Unit]
+Description=ZELUX Duck Studio backend (zeluxd)
+Documentation=file:///opt/zelux/current/software/README.md
+# 这个单元**故意不依赖 network-online.target**，这是踩坑后的决定：
+#   1) network-online 的含义是"有上游互联网"。热点兜底模式下它永远不满足，
+#      只能靠 nm-online --timeout=20 等满 20 秒才放行 → 网页要多等 20 秒。
+#   2) 但 zeluxd 根本不需要互联网：它监听 0.0.0.0:8000，只要 lo 和本机网络栈起来
+#      就能接客。上游通不通只影响"板子能不能访问外网"，与网页能不能打开无关。
+#   所以：只 Wants（不阻塞），并把 After 收紧到 basic 级。
+#   首启末尾会 restart zeluxd 一次，兜住"依赖后装"的情况。
+Wants=zelux-fand.service zelux-firstboot.service
+After=network.target zelux-fand.service
+# 同一份代码在本机（sim）也能跑，所以这里不依赖任何图形界面 / seat / dbus 会话。
+
+[Service]
+Type=simple
+User=zelux
+Group=zelux
+# /opt/zelux/current → releases/<版本>，升级只切软链，进程跟着重启
+WorkingDirectory=/opt/zelux/current/software
+Environment=ZELUX_MODE=radxa
+Environment=ZELUX_STATE=/var/lib/zelux
+Environment=ZELUX_PORT=8000
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# 可选的人工覆盖（/etc/zelux/zelux.toml 是主配置，这里只放临时调试用变量）
+EnvironmentFile=-/etc/zelux/zelux.env
+# 启动器负责把 TOML 翻成 ZELUX_*，并挑 venv 里的解释器
+ExecStart=/usr/local/bin/zeluxd-run
+Restart=always
+RestartSec=2
+# 78 = 依赖没装好（首启还没跑完 / 现场没网装不上）。这种情况不重试，等人工处理，
+# 否则日志会被 2 秒一条的 ImportError 刷满，真正的错误反而看不见。
+RestartPreventExitStatus=78
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+# 能少给就少给：整个文件系统只读，只有状态目录和升级目录可写
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/var/lib/zelux /opt/zelux
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

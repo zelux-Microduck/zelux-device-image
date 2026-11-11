@@ -1,0 +1,152 @@
+#!/bin/bash
+# VL53L5CX（8×8 ToF）驱动辅助：诊断 + 安装用户态驱动库
+#
+# 为什么需要"装驱动"这件事：VL53L5CX 出厂只有一段 bootloader，内核里没有能直接出数的驱动，
+# 必须由用户态把 ST 的 84 KB 固件灌进去才出数据。所以缺的不是内核模块，而是 pip 包
+# vl53l5cx-ctypes（zeluxd/hal/radxa_tof.py 只认它）。
+#
+# 跑在哪：板子上（root，要装到 /opt/zelux/venv）。
+# 会改动什么：只在 --install / --from 时往 venv 里装包；默认只读诊断。
+#
+# 用法：
+#   zelux-tof-install                 # 只诊断：总线在不在、设备认不认、库装没装
+#   zelux-tof-install --install       # 联网装 vl53l5cx-ctypes
+#   zelux-tof-install --offline       # 从 /opt/zelux/wheels 装（现场没网）
+#   zelux-tof-install --from ./vl53l5cx_ctypes-1.0.0-py3-none-any.whl
+set -euo pipefail
+
+readonly CONFIG="/etc/zelux/zelux.toml"
+readonly VENV_PY="/opt/zelux/venv/bin/python"
+
+BUS=3
+BUS_SET=0
+ADDR7=0x29
+MODE="diagnose"
+FROM=""
+
+log() { printf '[zelux-tof] %s\n' "$*" >&2; }
+warn() { printf '[zelux-tof] !! %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install) MODE="install"; shift ;;
+        --offline) MODE="offline"; shift ;;
+        --from) MODE="from"; FROM="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+        --bus) BUS="${2:-3}"; BUS_SET=1; shift; [ $# -gt 0 ] && shift || true ;;
+        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        *) die "不认识的参数：$1" ;;
+    esac
+done
+
+# ---------------------------------------------------------------- 配置里拿总线号
+if [ "$BUS_SET" -eq 0 ] && command -v python3 >/dev/null 2>&1 && [ -f "$CONFIG" ]; then
+    read_cfg="$(python3 - "$CONFIG" <<'PY' 2>/dev/null || true
+import sys
+try:
+    import tomllib
+    cfg = tomllib.load(open(sys.argv[1], "rb"))
+    tof = cfg.get("tof") or {}
+    bus = (cfg.get("i2c") or {}).get("bus", tof.get("bus"))
+    addr = tof.get("addr")
+    print(f"{bus if bus is not None else 3} {addr if addr is not None else 0x52}")
+except Exception:
+    pass
+PY
+)"
+    if [ -n "$read_cfg" ]; then
+        BUS="${read_cfg%% *}"
+        ADDR8="${read_cfg##* }"
+        # 配置里写的是丝印地址（8 位写地址），i2cdetect 要 7 位
+        ADDR7="$(printf '0x%02x' $(( ADDR8 / 2 )) 2>/dev/null || echo 0x29)"
+    fi
+fi
+
+py_has_lib() {
+    if [ -x "$VENV_PY" ]; then
+        "$VENV_PY" -c "import vl53l5cx_ctypes" >/dev/null 2>&1
+    else
+        PYTHONPATH="/opt/zelux/pylibs" python3 -c "import vl53l5cx_ctypes" >/dev/null 2>&1
+    fi
+}
+
+# ---------------------------------------------------------------- 诊断
+diagnose() {
+    local bad=0
+    echo "== I²C 总线 =="
+    if [ -e "/dev/i2c-${BUS}" ]; then
+        echo "  /dev/i2c-${BUS} 存在"
+        ls -l "/dev/i2c-${BUS}" || true
+    else
+        warn "/dev/i2c-${BUS} 不存在"
+        echo "  → 设备树没开这一路 I²C。Radxa 的 /boot 里找 overlay（见 docs/02-硬件接线.md）"
+        bad=1
+    fi
+
+    echo
+    echo "== 设备扫描（7 位地址 ${ADDR7}）=="
+    if ! command -v i2cdetect >/dev/null 2>&1; then
+        warn "没有 i2cdetect：sudo apt install i2c-tools"
+        bad=1
+    elif [ -e "/dev/i2c-${BUS}" ]; then
+        if i2cdetect -y "$BUS" 2>/dev/null | grep -qiE "^[0-9a-f]{2}:.*\b$(printf '%02x' $(( ADDR7 )))\b"; then
+            echo "  在 ${ADDR7} 上找到设备"
+        else
+            warn "在 ${ADDR7} 上没看到设备"
+            echo "  → 检查 4pin 线序（3V3 / GND / SDA / SCL 别插反）、上拉、供电"
+            echo "  → 有的模块丝印 0x52 但实际是 0x29，两个都扫不到就是没通"
+            bad=1
+        fi
+    fi
+
+    echo
+    echo "== 用户态驱动库 =="
+    if py_has_lib; then
+        echo "  vl53l5cx_ctypes 已安装"
+    else
+        warn "没装 vl53l5cx_ctypes（ToF 会显示 unsupported）"
+        echo "  → sudo zelux-tof-install --install"
+        bad=1
+    fi
+
+    echo
+    echo "== zeluxd 眼里的 ToF =="
+    if command -v zeluxd-run >/dev/null 2>&1; then
+        zeluxd-run --check 2>&1 | sed -n '1,10p' || true
+    fi
+
+    [ "$bad" -eq 0 ] && echo && log "全部就绪"
+    return 0
+}
+
+# ---------------------------------------------------------------- 安装
+do_install() {
+    [ "$(id -u)" -eq 0 ] || die "要 root（sudo zelux-tof-install ...）"
+    case "$MODE" in
+        install) /usr/local/bin/zelux-deps --tof ;;
+        offline) /usr/local/bin/zelux-deps --offline --tof ;;
+        from)
+            [ -n "$FROM" ] || die "用法：zelux-tof-install --from <whl|tar.gz>"
+            [ -e "$FROM" ] || die "没有这个文件：$FROM"
+            if [ -x "$VENV_PY" ]; then
+                "$VENV_PY" -m pip install --no-input "$FROM"
+            else
+                python3 -m pip install --no-input --target /opt/zelux/pylibs \
+                    --break-system-packages "$FROM"
+            fi
+            ;;
+    esac
+    if py_has_lib; then
+        log "装好了。重启服务让 zeluxd 重新探测：sudo systemctl restart zeluxd"
+    else
+        die "装完还是 import 不到 vl53l5cx_ctypes，看上面的 pip 报错"
+    fi
+    echo
+    diagnose
+}
+
+if [ "$MODE" = "diagnose" ]; then
+    diagnose
+else
+    do_install
+fi

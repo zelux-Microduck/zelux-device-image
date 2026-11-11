@@ -1,0 +1,680 @@
+#!/bin/bash
+# ZELUX 首次开机配置（幂等：初始化过就直接退出）
+#
+# 跑在哪：板子上，由 zelux-firstboot.service 以 root 在开机时调用一次
+#         （Type=oneshot，ConditionPathExists=!/var/lib/zelux/.initialized）。
+# 要什么权限：root（要 growpart/resize2fs、改 hostname、写 auth.json、改 WiFi）。
+# 会改动什么：
+#   - 根分区扩容到整张卡（growpart + resize2fs，在线操作，不重启）
+#   - /etc/hostname、/etc/hosts（127.0.1.1）
+#   - /var/lib/zelux/auth.json（网页口令的 PBKDF2 哈希，只在文件不存在时写）
+#   - zelux 用户的系统口令（与网页口令相同，方便 SSH 登录）
+#   - 30 秒内连不上任何 WiFi 就启动 zelux-ap 热点（改的是运行态，不改配置文件）
+#   - /var/lib/zelux/.initialized（完成标记）
+# 不做的事：不装驱动、不改设备树、不覆盖已有 auth.json。
+#
+# 手工重跑：sudo rm /var/lib/zelux/.initialized && sudo zelux-firstboot
+set -euo pipefail
+
+readonly STATE_DIR="/var/lib/zelux"
+readonly FLAG="${STATE_DIR}/.initialized"
+readonly CONFIG="/etc/zelux/zelux.toml"
+readonly LOCK="/run/zelux-firstboot.lock"
+readonly VERSION_FILE="/opt/zelux/VERSION"
+
+# 默认值（配置文件读不到也不至于把机器配成黑盒）
+HOSTNAME_CFG="zelux-duck"
+PASSWORD_CFG="zelux"
+TIMEZONE_CFG="Asia/Shanghai"
+AP_CONN="zelux-ap"
+AP_SSID="ZELUX-Duck"
+AP_PASSWORD="zeluxduck"
+AP_IP="192.168.4.1"
+FALLBACK_AFTER=30
+PORT_CFG="8000"
+
+log() { printf '[zelux-firstboot] %s\n' "$*" >&2; }
+warn() { printf '[zelux-firstboot] !! %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- 诊断日志落盘
+# 为什么要把日志写到 FAT 分区：
+#   板子起不来时，既没有串口线也没法 SSH，唯一能拿到的就是卡本身。
+#   FAT 分区（Windows/macOS 能直接读）上留一份日志，拔卡插电脑就能看，
+#   不用猜"到底卡在哪一步"。这是本次排查 wlan0 起不来时最缺的东西。
+#
+# ⚠ 挂载点必须按 Radxa 官方 bookworm 镜像的实际情况来（fstab 原文）：
+#     UUID=21BD-9125 /config     vfat   ← p1，标签 config，16 MB，**这个才是该写的**
+#     UUID=21BD-F314 /boot/efi   vfat   ← p2，标签 efi，300 MB
+#     UUID=d3e135... /           ext4   ← p3，根分区（extlinux.conf 在这里面）
+#   早期版本写的是 /boot/efi 和 /boot —— 前者是 p2（拔卡也能读，但 Radxa 不用它
+#   放配置），后者**根本不是 FAT**，只是根分区里的一个普通目录，写进去拔卡读不到。
+#   所以现在以 /config 为第一优先。
+write_diag() {
+    local msg="$1"
+    local mp
+    for mp in /config /boot/firmware /boot/efi /boot; do
+        if mountpoint -q "$mp" 2>/dev/null && [ -w "$mp" ]; then
+            printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$msg" >> "$mp/zelux-firstboot.log" 2>/dev/null && return 0
+        fi
+    done
+    # 单分区基底（Armbian 那种 1 个 ext4 到底的镜像）没有 FAT 可写，
+    # 但 /boot 一定在 rootfs 里 —— 留一份，至少挂卡到 Linux 上能看到。
+    for mp in /boot /var/log; do
+        [ -d "$mp" ] && [ -w "$mp" ] && {
+            printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$msg" >> "$mp/zelux-firstboot.log" 2>/dev/null && return 0
+        }
+    done
+    return 1
+}
+
+# 把关键日志同时写到 FAT（尽力而为，失败不影响主流程）
+diag() {
+    log "$*"
+    write_diag "$*" || true
+}
+
+# HDMI 上直接出字（串口控制台被舵机总线占了，见 docs/02-硬件接线.md）
+# 板子的 debug 串口（ttyFIQ0）再兜一份：单分区镜像没有 FAT 可写时，
+# 一根 USB-TTL 接上去就是唯一的现场眼睛。
+say() {
+    local line
+    line="$(printf '\n\033[1;36m[ZELUX]\033[0m %s\n' "$*")"
+    printf '%s\n' "$line" >&2 || true
+    local d
+    for d in /dev/tty1 /dev/ttyFIQ0; do
+        [ -w "$d" ] && printf '%s\n' "$line" > "$d" 2>/dev/null || true
+    done
+}
+
+die() { log "$*"; exit 1; }
+
+# ---------------------------------------------------------------- 0. 前置
+[ "$(id -u)" -eq 0 ] || die "必须 root 运行（sudo zelux-firstboot）"
+mkdir -p "$STATE_DIR" /run
+
+# 同一时刻只允许一个实例（systemd 和手工各起一次的情况真的会发生）
+exec 9>"$LOCK" || die "建不了 $LOCK"
+if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || { log "另一个 zelux-firstboot 正在跑，退出"; exit 0; }
+fi
+
+if [ -e "$FLAG" ]; then
+    log "已经初始化过（$(cat "$FLAG" 2>/dev/null | head -1)），跳过"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- 1. 读配置
+read_cfg() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$CONFIG" <<'PY' || true
+import sys
+path = sys.argv[1]
+try:
+    import tomllib
+    with open(path, "rb") as fh:
+        cfg = tomllib.load(fh)
+except Exception:
+    sys.exit(0)
+sysc = cfg.get("system") or {}
+wifi = cfg.get("wifi") or {}
+items = {
+    "hostname": sysc.get("hostname"),
+    "password": sysc.get("password"),
+    "timezone": sysc.get("timezone"),
+    "port": sysc.get("port"),
+    "ap_connection": wifi.get("ap_connection"),
+    "ap_ssid": wifi.get("ap_ssid"),
+    "ap_password": wifi.get("ap_password"),
+    "ap_ip": wifi.get("ap_ip"),
+    "fallback_after_s": wifi.get("fallback_after_s"),
+}
+for key, value in items.items():
+    if value is not None:
+        print(f"{key}\t{value}")
+PY
+}
+
+while IFS=$'\t' read -r _key _val; do
+    [ -n "${_key:-}" ] || continue
+    case "$_key" in
+        hostname)        HOSTNAME_CFG="$_val" ;;
+        password)        PASSWORD_CFG="$_val" ;;
+        timezone)        TIMEZONE_CFG="$_val" ;;
+        port)            PORT_CFG="$_val" ;;
+        ap_connection)   AP_CONN="$_val" ;;
+        ap_ssid)         AP_SSID="$_val" ;;
+        ap_password)     AP_PASSWORD="$_val" ;;
+        ap_ip)           AP_IP="$_val" ;;
+        fallback_after_s) FALLBACK_AFTER="$_val" ;;
+    esac
+done < <(read_cfg)
+
+case "$FALLBACK_AFTER" in ''|*[!0-9]*) FALLBACK_AFTER=30 ;; esac
+
+say "首次开机配置开始（约 2–3 分钟，别拔电）"
+
+# ---------------------------------------------------------------- 2. 根分区扩容
+grow_rootfs() {
+    local src parent num fs
+    src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+    case "${src:-}" in
+        /dev/*) ;;
+        *) warn "根分区不是块设备（${src:-未知}），跳过扩容"; return 0 ;;
+    esac
+    fs="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+    if [ "$fs" != "ext4" ]; then
+        warn "根文件系统是 $fs 不是 ext4，跳过 resize2fs"; return 0
+    fi
+    parent="/dev/$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)"
+    num="$(cat "/sys/class/block/$(basename "$src")/partition" 2>/dev/null || true)"
+    if [ -z "$num" ]; then
+        warn "分不清 $src 的分区号，跳过扩容"; return 0
+    fi
+
+    # 先看还有没有空余：没有就什么都别做（避免每次开机都动分区表）
+    # 三条路依次试：
+    #   ① growpart（cloud-guest-utils，Radxa 镜像一般没有）
+    #   ② sfdisk —— util-linux/fdisk 自带，**Armbian 基底走这条**（`echo ", +"` 把分区拉满）
+    #   ③ 都没有就只做文件系统扩容（分区没变大，resize2fs 也只能到分区尾）
+    local out grew=0
+    if command -v growpart >/dev/null 2>&1; then
+        out="$(growpart "$parent" "$num" 2>&1 || true)"
+        case "$out" in
+            *NOCHANGE*) log "分区已经是整卡大小，不用扩" ;;
+            *FAILED*|*"failed"*|*"unable"*) warn "growpart 失败：$out" ;;
+            *) log "分区已扩到卡尾"; grew=1 ;;
+        esac
+    elif command -v sfdisk >/dev/null 2>&1; then
+        # sfdisk 的 ", +" 表示"从原起点扩到最后一个可用扇区"。
+        # --no-reread 是因为根分区正在用，内核会拒绝重读分区表 —— 下面 partx 补一次。
+        out="$(printf ', +\n' | sfdisk --force --no-reread -N "$num" "$parent" 2>&1 || true)"
+        case "$out" in
+            *"does not contain a defined partition"*|*error*|*Error*|*ailed*)
+                warn "sfdisk 扩分区失败：$(printf '%s' "$out" | tr '\n' ' ')" ;;
+            *)
+                log "分区已用 sfdisk 扩到卡尾"
+                grew=1
+                # 让内核重新读分区表（不重读的话 resize2fs 会以为分区还是原大小）
+                partx -u "$parent" 2>/dev/null || blockdev --rereadpt "$parent" 2>/dev/null || true
+                ;;
+        esac
+    else
+        warn "没有 growpart/sfdisk，只做文件系统扩容（卡上多出来的空间用不到）"
+    fi
+    [ "$grew" -eq 1 ] && sleep 1
+    local rs_out=""
+    rs_out="$(resize2fs "$src" 2>&1 || true)"
+    if [ -n "$rs_out" ]; then
+        printf '%s\n' "$rs_out" | tail -2 >&2
+    fi
+    if df -h / >/dev/null 2>&1; then
+        log "根文件系统当前大小：$(df -h / | awk 'NR==2{print $2}')"
+    fi
+    case "$rs_out" in
+        *"Nothing to do"*|*"already"*) : ;;
+        *rror*|*ail*) warn "resize2fs 有问题（不影响使用，只是空间没吃完）：$(printf '%s' "$rs_out" | tr '\n' ' ')" ;;
+        *) : ;;
+    esac
+}
+grow_rootfs || warn "扩容这一步出错，继续"
+
+# ---------------------------------------------------------------- 3. hostname
+set_hostname() {
+    local cur
+    cur="$(cat /etc/hostname 2>/dev/null || echo "")"
+    if [ "$cur" != "$HOSTNAME_CFG" ]; then
+        if [ -d /run/systemd/system ] && command -v hostnamectl >/dev/null 2>&1; then
+            hostnamectl set-hostname "$HOSTNAME_CFG" || warn "hostnamectl 失败"
+        else
+            printf '%s\n' "$HOSTNAME_CFG" > /etc/hostname
+            hostname "$HOSTNAME_CFG" 2>/dev/null || true
+        fi
+        log "hostname -> $HOSTNAME_CFG"
+    fi
+    if ! grep -qE "^127\.0\.1\.1[[:space:]]+${HOSTNAME_CFG}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+        sed -i -E '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts 2>/dev/null || true
+        printf '127.0.1.1\t%s\n' "$HOSTNAME_CFG" >> /etc/hosts
+    fi
+}
+set_hostname || warn "设置 hostname 失败"
+
+# ---------------------------------------------------------------- 4. 时区
+if [ -n "$TIMEZONE_CFG" ] && [ -e "/usr/share/zoneinfo/$TIMEZONE_CFG" ]; then
+    if [ "$(cat /etc/timezone 2>/dev/null || echo '')" != "$TIMEZONE_CFG" ]; then
+        ln -sfn "/usr/share/zoneinfo/$TIMEZONE_CFG" /etc/localtime || warn "设时区失败"
+        printf '%s\n' "$TIMEZONE_CFG" > /etc/timezone || true
+        log "时区 -> $TIMEZONE_CFG"
+    fi
+fi
+
+# ---------------------------------------------------------------- 5. 口令
+init_auth_json() {
+    local auth="$STATE_DIR/auth.json"
+    if [ -f "$auth" ]; then
+        log "auth.json 已存在，保留现场口令"
+        return 0
+    fi
+    python3 - "$auth" "$PASSWORD_CFG" <<'PY'
+import hashlib, json, os, secrets, sys
+
+path, password = sys.argv[1], sys.argv[2]
+iterations = 200_000                       # 与 software/zeluxd/auth.py 的 ITER 一致
+salt = secrets.token_bytes(16)
+digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump({"salt": salt.hex(), "hash": digest.hex(),
+               "iter": iterations, "no_password": False}, fh)
+os.replace(tmp, path)
+os.chmod(path, 0o640)
+PY
+    if id zelux >/dev/null 2>&1; then
+        chown zelux:zelux "$auth" 2>/dev/null || warn "chown auth.json 失败"
+    fi
+    log "已写入网页初始口令（登录名任意，口令见文档；请登录后在设置里改掉）"
+}
+if command -v python3 >/dev/null 2>&1; then
+    init_auth_json || warn "写 auth.json 失败，网页会用默认口令兜底"
+else
+    warn "没有 python3，跳过 auth.json（zeluxd 会用默认口令自建）"
+fi
+
+# 系统口令（SSH / 控制台），和网页口令保持一致，省得现场记两套
+if id zelux >/dev/null 2>&1 && [ -n "$PASSWORD_CFG" ]; then
+    if printf 'zelux:%s\n' "$PASSWORD_CFG" | chpasswd 2>/dev/null; then
+        log "zelux 用户口令已设置"
+    else
+        warn "设置 zelux 系统口令失败（不影响网页登录）"
+    fi
+fi
+
+# 只给 zeluxd 需要写的那几样，不要 -R：backup/ 里是 /etc 的备份，不该给业务用户
+if id zelux >/dev/null 2>&1; then
+    mkdir -p "$STATE_DIR/models" "$STATE_DIR/shots"
+    chown zelux:zelux "$STATE_DIR" "$STATE_DIR/models" "$STATE_DIR/shots" 2>/dev/null || true
+    [ -f "$STATE_DIR/auth.json" ] && chown zelux:zelux "$STATE_DIR/auth.json" 2>/dev/null || true
+fi
+chmod 750 "$STATE_DIR" 2>/dev/null || true
+
+# ---------------------------------------------------------------- 6. 网络 / 热点兜底
+# 判断"已经联网"时必须**只看无线网卡**。
+# 之前用 `ip -4 -o addr show scope global` 取第一块有 IP 的网卡，逻辑是错的：
+# 只要插了网线（或者有 docker0/veth 之类），eth0 一上来就有 IP，
+# 于是脚本认定"已联网"，直接跳过建热点 —— 而手机根本不知道该连哪个网址。
+wifi_iface() {
+    # 优先按 nmcli 的 DEVICE 类型找，其次退回 wlan0 命名
+    # 注意：脚本是 set -euo pipefail，这里每条命令都要 || true，
+    # 否则"没装 nmcli"或"没有无线网卡"会让赋值语句直接终止整个首启。
+    local d=""
+    d="$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}' || true)"
+    [ -n "$d" ] || d="$(ls /sys/class/net 2>/dev/null | grep -E '^(wlan|wlp)' | head -1 || true)"
+    printf '%s' "$d"
+    return 0
+}
+
+# 只返回**无线网卡**上的全局 IP（热点自身的 192.168.4.1 也算，用它判断"入口可用"）
+wifi_ip() {
+    local iface ip
+    iface="$(wifi_iface || true)"
+    [ -n "$iface" ] || return 0
+    ip="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    printf '%s' "$ip"
+    return 0
+}
+
+# 是否有任何一块网卡（含有线）拿到 IP —— 只用于写日志，不再用来决定要不要起热点
+any_ip() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $2"=" $4}' | grep -v '^lo' | tr '\n' ' ' || true
+    return 0
+}
+
+# ---------------------------------------------------------------- dtb 换一张试试
+# 为什么需要这个：
+#   Radxa Zero 3W 出货过两种 WiFi 模组 —— AP6212（Broadcom）和 AIC8800（SDIO）。
+#   两者在设备树里是**互斥**的：用 AIC8800 的 dtb 驱动 AP6212，SDIO 上根本不会
+#   出现 wlan0；反过来也一样。这不是驱动没编译，是 dtb 里 pwrseq/enable 脚不一样。
+#   Armbian 在这个镜像里只放了两张相关 dtb：
+#       rk3566-radxa-zero3.dtb            ← AIC8800
+#       rk3566-radxa-zero3-ap6212.dtb     ← AP6212
+#   如果拿到的板子和镜像默认那张不匹配，用户看到的就是"连 WiFi 列表都搜不到"。
+#
+# 所以：首启发现"完全没网卡 + 设备树里也没有 wifi 节点"时，换另一张 dtb 重启一次。
+# 只做一次（.dtb-switched 打标记），绝不能陷入重启循环。
+try_switch_dtb() {
+    local flag=/var/lib/zelux/.dtb-switched
+    local env=/boot/armbianEnv.txt
+    local exl=/boot/extlinux/extlinux.conf
+    local cur other
+
+    [ -f "$flag" ] && { diag "已经换过一次 dtb（$flag 在），不再自动重试"; return 0; }
+    if [ ! -f "$env" ] && [ ! -f "$exl" ]; then
+        diag "没有 armbianEnv.txt/extlinux.conf，无法换 dtb（不是 Armbian 基底）"
+        return 0
+    fi
+
+    cur="$(sed -n 's/^fdtfile=//p' "$env" 2>/dev/null | head -1 || true)"
+    [ -n "$cur" ] || cur="$(sed -n 's|^[[:space:]]*fdt[[:space:]]\+/boot/dtb/||p' "$exl" 2>/dev/null | head -1 || true)"
+
+    case "$cur" in
+        *zero3-ap6212*) other="rockchip/rk3566-radxa-zero3.dtb" ;;
+        *zero3*)        other="rockchip/rk3566-radxa-zero3-ap6212.dtb" ;;
+        *)              diag "当前 dtb='$cur' 不是 zero3 系列，不自动切换"; return 0 ;;
+    esac
+
+    if [ ! -f "/boot/dtb/$other" ]; then
+        diag "另一张 dtb 不存在：/boot/dtb/$other，跳过"
+        return 0
+    fi
+
+    diag "当前 dtb=$cur（这个模组没起来），改换 $other 后重启一次"
+    write_diag "INFO  自动切换 dtb：$cur -> $other（只做一次）"
+
+    # 两处都要改：Armbian 的 u-boot 读 extlinux.conf 的 fdt 行；
+    # armbianEnv.txt 是 u-boot 的通用参数文件，u-boot-update 会用它重新生成 extlinux。
+    [ -f "$env" ] && sed -i "s|^fdtfile=.*|fdtfile=$other|" "$env" 2>/dev/null || true
+    if [ -f "$exl" ]; then
+        sed -i "s|^\([[:space:]]*fdt[[:space:]]\+\)/boot/dtb/.*|\1/boot/dtb/$other|" "$exl" 2>/dev/null || true
+    fi
+
+    mkdir -p /var/lib/zelux 2>/dev/null || true
+    printf '%s -> %s\n' "$cur" "$other" > "$flag" 2>/dev/null || true
+
+    sync
+    diag "改完立即重启（首启会在重启后继续，.initialized 还没写）"
+    # 给 journal/FAT 日志一点时间落地，然后重启
+    sleep 2
+    systemctl reboot 2>/dev/null || reboot -f 2>/dev/null || true
+    # 重启没生效就走下去，至少别把后面的步骤全卡住
+    return 0
+}
+
+wait_online() {
+    local i ip
+    for i in $(seq 1 "$FALLBACK_AFTER"); do
+        ip="$(wifi_ip)"
+        if [ -n "$ip" ]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+CURRENT_IP=""
+if command -v nmcli >/dev/null 2>&1; then
+    if ! nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
+        diag "NetworkManager 没在跑，先起它"
+        systemctl start NetworkManager 2>/dev/null || warn "NetworkManager 起不来"
+        sleep 3
+    fi
+
+    IFACE="$(wifi_iface)"
+    diag "无线网卡：${IFACE:-未找到}  当前有 IP 的网卡：$(any_ip)"
+    diag "设备树 model: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 读不到)"
+
+    # 网卡在的话，顺手扫一圈记下来 —— 这一行以后能直接回答
+    # "到底是没网卡，还是有网卡但 supplicant 坏了扫不出东西"：
+    #   有结果      → 无线栈正常
+    #   空结果      → 网卡在但扫描不出（supplicant / 监管域 / 固件问题）
+    if [ -n "$IFACE" ]; then
+        # 头一次扫描往往要等驱动 probe + 监管域加载，立刻查会是 0 个。
+        # 轮询 20 秒，避免"其实正常但日志里记了个 0"这种误导。
+        SCAN_AP=0
+        n=0
+        while [ "$n" -lt 10 ]; do
+            SCAN_AP="$(nmcli -t -f SSID device wifi list 2>/dev/null | grep -c . || true)"
+            SCAN_AP="${SCAN_AP:-0}"
+            [ "$SCAN_AP" -gt 0 ] && break
+            n=$((n + 1))
+            sleep 2
+        done
+        diag "扫描到 ${SCAN_AP} 个 SSID（等了 $((n * 2)) 秒）"
+        if [ "${SCAN_AP:-0}" -eq 0 ]; then
+            write_diag "WARN 扫描为空：网卡在但看不到任何 SSID"
+            write_diag "WARN  wpa enabled=$(systemctl is-enabled wpa_supplicant 2>/dev/null) active=$(systemctl is-active wpa_supplicant 2>/dev/null)"
+            write_diag "WARN  NM wifi: $(nmcli -f WIFI general 2>/dev/null | tr '\n' ' ')"
+            write_diag "WARN  rfkill: $(rfkill list 2>/dev/null | tr '\n' ' ')"
+            write_diag "WARN  regulatory: $(iw reg get 2>/dev/null | tr '\n' ' ')"
+            write_diag "WARN  supplicant D-Bus: $(busctl --system status fi.w1.wpa_supplicant1 2>&1 | head -3 | tr '\n' ' ')"
+            write_diag "WARN  NM 日志: $(journalctl -u NetworkManager -n 6 --no-pager 2>/dev/null | tr '\n' '|')"
+            write_diag "WARN  wpa 日志: $(journalctl -u wpa_supplicant -n 6 --no-pager 2>/dev/null | tr '\n' '|')"
+        fi
+    fi
+
+    # Radxa Zero 3W 出货过两种 WiFi 模组：AP6212（Broadcom/brcmfmac）
+    # 和 AIC8800（SDIO）。镜像两套固件+驱动都带了，但由 dtb 的 compatible 决定加载哪个。
+    # 万一 dtb 选成另一款，wlan0 就不会出现 —— 这里主动补一脚 modprobe 兜底。
+    if [ -z "$IFACE" ]; then
+        diag "没检测到无线网卡，尝试手动加载 WiFi 驱动"
+        for m in brcmfmac aic8800_fdrv_sdio aic8800_bsp_sdio; do
+            if modprobe "$m" 2>/dev/null; then
+                diag "  modprobe $m 成功"
+            else
+                diag "  modprobe $m 不可用（正常：另一款模组用不上）"
+            fi
+        done
+        sleep 3
+        IFACE="$(wifi_iface)"
+        diag "重新探测无线网卡：${IFACE:-仍然没有}"
+    fi
+
+    if [ -z "$IFACE" ]; then
+        warn "!! 没找到无线网卡 → 热点无法启动"
+        # 这一段是给"拔卡看日志"设计的：必须能一眼分出这几种完全不同的原因
+        #   A) dtb 错了（加载了 zero-3e）      → model 里没有 wifi 相关节点
+        #   B) SDIO 总线上根本没认到卡          → mmc 日志没有 new SDIO card
+        #   C) 认到卡但固件缺失/失败            → brcmfmac/aic8800 报 firmware 错
+        #   D) 网卡被 rfkill 关了               → rfkill 里有 blocked
+        write_diag "ERROR: no wifi interface after modprobe."
+        write_diag "ERROR 设备树 model: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 读不到)"
+        write_diag "ERROR 设备树 compatible: $(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || echo 读不到)"
+        # 判断 dtb 里到底有没有 wifi/sdio 节点
+        if [ -d /proc/device-tree/wireless-wlan ] || [ -e /proc/device-tree/wifi ]; then
+            write_diag "INFO  设备树里有 wifi 节点（dtb 选对了）"
+        else
+            write_diag "WARN  设备树里没有 wifi/sdio-wifi 节点 —— 很可能加载了 zero-3e 的 dtb（那个版本没 WiFi）"
+            write_diag "WARN  镜像应已钉死 fdt=rk3566-radxa-zero-3w-*.dtb，检查 /boot/extlinux/extlinux.conf"
+        fi
+        write_diag "ERROR rfkill: $(rfkill list 2>/dev/null | tr '\n' ' ')"
+        write_diag "ERROR SDIO 设备: $(ls -1 /sys/bus/sdio/devices/ 2>/dev/null | tr '\n' ' ' || echo 无)"
+        write_diag "ERROR mmc 日志: $(dmesg 2>/dev/null | grep -iE 'mmc[0-9]|sdio' | tail -10 | tr '\n' '|')"
+        write_diag "ERROR 驱动日志: $(dmesg 2>/dev/null | grep -iE 'brcmfmac|aic8800|firmware' | tail -10 | tr '\n' '|')"
+
+        # 最后一步：换另一张 dtb 试一次再重启。只在"完全没网卡"时做，
+        # 因为这是唯一能区分"模组型号不匹配"和"其它故障"的自动手段。
+        try_switch_dtb || true
+    else
+        # rfkill 软/硬阻塞会让网卡完全不可用，这一条以前完全没检查
+        if command -v rfkill >/dev/null 2>&1; then
+            if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+                diag "无线被 rfkill soft-block，解除"
+                rfkill unblock wifi 2>/dev/null || true
+            fi
+        fi
+
+        say "等 WiFi 连上已知网络（最多 ${FALLBACK_AFTER} 秒）…"
+        if CURRENT_IP="$(wait_online)"; then
+            diag "已联网：$IFACE -> $CURRENT_IP"
+        else
+            CURRENT_IP=""
+            say "没有可用 WiFi，启动兜底热点 ${AP_SSID}（密码 ${AP_PASSWORD}）"
+            diag "准备启动热点 $AP_CONN"
+
+            # 1) 让 NM 重新读盘上的 connection（我们可能刚写过）
+            nmcli connection reload 2>/dev/null || true
+            # 2) ⚠ 绝对不要去 stop wpa_supplicant —— 这里曾经是个致命错误。
+            #    Debian 12 的 NetworkManager **不会自己 spawn** wpa_supplicant，
+            #    它走 D-Bus 激活 fi.w1.wpa_supplicant1 → systemd 拉起 wpa_supplicant.service。
+            #    那个单元是 `wpa_supplicant -u -s`（只提供 D-Bus 服务，不接管任何网卡），
+            #    是 NM 的必需品，不是"抢网卡的进程"。停掉它 = NM 手上没有 supplicant
+            #    = 网卡不可用 = 连 WiFi 列表都刷不出来。
+            #    如果这里发现它没在跑，正确的动作是**把它拉起来**。
+            if ! systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
+                diag "wpa_supplicant 未在跑，拉起它（NM 需要它提供 D-Bus 服务）"
+                systemctl start wpa_supplicant 2>/dev/null \
+                    || diag "wpa_supplicant 起不来（看 journalctl -u wpa_supplicant）"
+            fi
+            # 3) 热点前先修 dnsmasq 的运行环境。
+            #    NM 的 shared 模式会 spawn 一个 dnsmasq 发 DHCP，但它：
+            #      a) 传 --conf-file=/dev/null，/etc/dnsmasq.conf 完全不生效；
+            #      b) 按 Debian 编译默认值降权到 nobody；
+            #      c) lease 文件要写在 /var/lib/NetworkManager（base 镜像是 0700 root:root）。
+            #    三者叠加 → dnsmasq 写不了 lease 直接退出 → 手机连上 SSID 但永远
+            #    "正在获取 IP 地址" → 用户看到的就是"网页打不开"。
+            #    构建期已经放了 drop-in（user=root）并改了目录权限，这里再兜一次，
+            #    防止有人用 install.sh 装到老 rootfs 上时漏掉。
+            nmdir="/var/lib/NetworkManager"
+            mkdir -p "$nmdir" 2>/dev/null || true
+            chmod 755 "$nmdir" 2>/dev/null || true
+            mkdir -p /etc/NetworkManager/dnsmasq-shared.d 2>/dev/null || true
+            if ! grep -qs '^[[:space:]]*user[[:space:]]*=[[:space:]]*root' \
+                 /etc/NetworkManager/dnsmasq-shared.d/00-zelux-lease.conf 2>/dev/null; then
+                printf '# ZELUX：热点模式的 dnsmasq 不要降权（要写 /var/lib/NetworkManager 的 lease）\nuser=root\n' \
+                    > /etc/NetworkManager/dnsmasq-shared.d/00-zelux-lease.conf 2>/dev/null || true
+                diag "补写了 dnsmasq-shared.d drop-in（user=root）"
+            fi
+            mkdir -p /run/NetworkManager 2>/dev/null || true
+
+            # 4) 起热点，失败时把真实错误记下来（以前是 >/dev/null 吞掉了）
+            #    重试 3 次、间隔 5 秒：NM 刚启动时 wlan0 常常还没 ready，
+            #    "device not ready / not managed" 这类错误等一下就能过去。
+            AP_ERR=""
+            attempt=1
+            while [ "$attempt" -le 3 ]; do
+                AP_ERR="$(nmcli connection up "$AP_CONN" 2>&1)" || true
+                sleep 3
+                [ -n "$(wifi_ip)" ] && break
+                diag "热点第 ${attempt} 次启动未成功，5 秒后重试：${AP_ERR}"
+                sleep 5
+                # 每轮重试前再确认一次网卡状态（NM 可能刚把 wlan0 接管）
+                nmcli device set "$IFACE" managed yes 2>/dev/null || true
+                attempt=$((attempt + 1))
+            done
+            if [ -n "$(wifi_ip)" ]; then
+                CURRENT_IP="$AP_IP"
+                diag "热点已启动：$AP_SSID -> $CURRENT_IP"
+
+                # 5) 热点起来 ≠ 手机能上网。真正决定"能不能打开网页"的是
+                #    dnsmasq 有没有在发 DHCP。这里显式验证一次：
+                #      · 53/67 端口有没有人监听
+                #      · dnsmasq 进程在不在、以什么用户跑
+                #      · iptables 的 NAT 规则有没有建（shared 模式要 masquerade）
+                sleep 3
+                DHCP_LISTEN="$(ss -lnup 2>/dev/null | grep -c ':67' || true)"
+                if [ "${DHCP_LISTEN:-0}" -gt 0 ]; then
+                    diag "DHCP 服务已在监听 udp/67（手机能拿到 IP）"
+                else
+                    write_diag "WARN  热点起来了，但 udp/67 没人监听 → 手机拿不到 IP，网页打不开"
+                    write_diag "WARN  dnsmasq 进程: $(ps -eo user,args 2>/dev/null | grep '[d]nsmasq' | tr '\n' '|' || echo 无)"
+                    write_diag "WARN  dnsmasq 报错: $(journalctl -u NetworkManager -n 10 --no-pager 2>/dev/null | grep -i dnsmasq | tr '\n' '|')"
+                    write_diag "WARN  lease 目录: $(stat -c '%a %U:%G' /var/lib/NetworkManager 2>/dev/null || echo 不存在)"
+                    write_diag "WARN  dnsmasq 配置: $(ls /etc/NetworkManager/dnsmasq-shared.d/ 2>/dev/null | tr '\n' ' ')"
+                fi
+                diag "NAT 规则: $(iptables -t nat -S 2>/dev/null | grep -c MASQUERADE || echo 0) 条 MASQUERADE"
+                diag "已连到热点的设备: $(ip neigh show dev "$IFACE" 2>/dev/null | grep -c REACHABLE || true)"
+            else
+                warn "热点起不来"
+                # 把真实原因写下来（以前 >/dev/null 2>&1 把错误全吞了，现场只能靠猜）
+                write_diag "ERROR nmcli: ${AP_ERR:-<无输出>}"
+                write_diag "ERROR connections: $(nmcli -t -f NAME,TYPE connection show 2>/dev/null | tr '\n' ' ')"
+                write_diag "ERROR nmcli general: $(nmcli -t general status 2>/dev/null | tr '\n' ' ')"
+                write_diag "ERROR wpa_supplicant active: $(systemctl is-active wpa_supplicant 2>/dev/null)"
+                write_diag "ERROR wpa_supplicant masked: $(systemctl is-enabled wpa_supplicant 2>/dev/null)"
+                write_diag "ERROR supplicant D-Bus: $(nmcli -f WIFI general 2>/dev/null | tr '\n' ' ')"
+                write_diag "ERROR dnsmasq active: $(systemctl is-active dnsmasq 2>/dev/null)"
+                write_diag "ERROR dnsmasq bin: $(command -v dnsmasq || echo none)"
+                write_diag "ERROR NM journal: $(journalctl -u NetworkManager -n 12 --no-pager 2>/dev/null | tr '\n' '|')"
+                write_diag "ERROR wpa journal: $(journalctl -u wpa_supplicant -n 6 --no-pager 2>/dev/null | tr '\n' '|')"
+                write_diag "ERROR 连接文件权限: $(stat -c '%a %U:%G' "/etc/NetworkManager/system-connections/${AP_CONN}.nmconnection" 2>/dev/null || echo 不存在)"
+                nmcli connection show 2>/dev/null | head -20 >&2 || true
+            fi
+        fi
+    fi
+else
+    warn "没有 nmcli（NetworkManager 未安装），跳过联网/热点"
+    write_diag "ERROR: nmcli not found"
+    CURRENT_IP="$(wifi_ip)"
+fi
+
+# ---------------------------------------------------------------- 7. 依赖
+# 首启才装：镜像是在 x86 上构建的，aarch64 的轮子没法提前跑起来。
+#
+# 关键：此刻板子很可能**没有外网**（它刚开的热点是自己的 192.168.4.1，没有上游）。
+# 所以必须是「本地轮子优先，联网兜底」，否则 pip 一定超时，
+# zeluxd 退出 78，网页永远打不开 —— 形成"要装依赖得联网、要联网得先有网页"的死循环。
+if [ -x /usr/local/bin/zelux-deps ]; then
+    if /usr/local/bin/zelux-deps --check >/dev/null 2>&1; then
+        log "依赖已就绪，跳过安装"
+    else
+        WHEEL_DIR="/opt/zelux/wheels"
+        if [ -d "$WHEEL_DIR" ] && [ -n "$(ls -A "$WHEEL_DIR" 2>/dev/null)" ]; then
+            WHEEL_N="$(ls -1 "$WHEEL_DIR"/*.whl 2>/dev/null | wc -l)"
+            say "安装 Python 依赖（离线，镜像内已带 ${WHEEL_N} 个轮子）…"
+            if /usr/local/bin/zelux-deps --offline; then
+                log "离线依赖安装完成"
+            else
+                warn "离线安装失败，尝试联网（此时多半没网，可能也会失败）"
+                /usr/local/bin/zelux-deps || warn "依赖没装全，zeluxd 可能起不来（看 journalctl -u zeluxd）"
+            fi
+        else
+            say "安装 Python 依赖（镜像内没有离线轮子，需要外网 1–2 分钟）…"
+            /usr/local/bin/zelux-deps || warn "依赖没装全（无外网时必然失败）：zeluxd 会退出 78"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------- 8. 收尾
+VER="$(head -1 "$VERSION_FILE" 2>/dev/null || echo "unknown")"
+{
+    printf 'version=%s\n' "$VER"
+    printf 'time=%s\n' "$(date -Is)"
+    printf 'ip=%s\n' "${CURRENT_IP:-none}"
+} > "$FLAG"
+chmod 644 "$FLAG"
+
+if [ -n "$CURRENT_IP" ]; then
+    say "配置完成：浏览器打开 http://${CURRENT_IP}:${PORT_CFG}"
+    say "热点：${AP_SSID} / ${AP_PASSWORD}    默认口令：${PASSWORD_CFG}（登录后请改）"
+else
+    say "配置完成，但没拿到 IP：接 HDMI 看提示，或插网线，或手机连 ${AP_SSID}"
+fi
+
+# ------------------------------------------------------------------ 9. 拉起 zeluxd
+# 这里踩过一个坑，必须写清楚，否则以后有人会"优化"回去：
+#   zeluxd.service 里有 RestartPreventExitStatus=78，意思是"依赖没装好就别 2 秒一次
+#   地重启刷日志"。副作用是：一旦它因 78 退出过，systemd 认为这个单元是 **stopped**
+#   且不打算再试。
+#   而 `systemctl try-restart` 只对 **正在运行** 的单元生效 —— 对已 stopped 的单元
+#   它直接返回成功、什么也不做（连错误都没有，所以 `|| warn` 也不会触发）。
+#   结果就是：首启把依赖装好了，zeluxd 却永远起不来 → 热点能连、网页打不开。
+#   所以这里必须用 restart（它等价于 stop+start，对 stopped 单元也会 start）。
+systemctl restart zeluxd 2>/dev/null || warn "拉起 zeluxd 失败（journalctl -u zeluxd 看原因）"
+
+# 再等它把 8000 端口真正 listen 上，确认"网页确实能开"。
+# 这一步是给使用者一个确定的信号，也顺便把失败写进日志 —— 而不是让人对着转圈猜。
+if command -v ss >/dev/null 2>&1; then
+    listen_ok=0
+    for _ in $(seq 1 15); do
+        sleep 1
+        if ss -lnt 2>/dev/null | grep -q ":${PORT_CFG} "; then
+            listen_ok=1
+            break
+        fi
+    done
+    if [ "$listen_ok" -eq 1 ]; then
+        say "网页已就绪：http://${CURRENT_IP:-192.168.4.1}:${PORT_CFG}"
+        diag "zeluxd 已在 ${PORT_CFG} 上监听"
+    else
+        say "zeluxd 没在 ${PORT_CFG} 上监听，稍后再试一次，或看 journalctl -u zeluxd"
+        write_diag "ERROR zeluxd 未监听 ${PORT_CFG}（15 秒内）"
+        write_diag "ERROR zeluxd 状态: $(systemctl is-active zeluxd 2>/dev/null)/$(systemctl is-enabled zeluxd 2>/dev/null)"
+        write_diag "ERROR zeluxd journal: $(journalctl -u zeluxd -n 15 --no-pager 2>/dev/null | tr '\n' '|')"
+    fi
+else
+    diag "没有 ss 命令，跳过端口监听确认"
+fi
+
+log "完成（${VER}）"
+exit 0

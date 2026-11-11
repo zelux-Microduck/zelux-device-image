@@ -1,0 +1,11 @@
+# 让 zelux 用户直接开舵机总线 / I²C，而不是靠 sudo
+# （zeluxd 自己就能跑 ZELUX_NO_MOTIOND=1 的台架模式；转接板插拔后权限也不会丢）
+
+# 舵机总线：TTL 半双工 1 Mbps
+KERNEL=="ttyS2", GROUP="zelux", MODE="0660", SYMLINK+="zelux-servo"
+
+# I²C-3：VL53L5CX（0x29）+ IMU
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-3", GROUP="zelux", MODE="0660"
+
+# 注意：/sys/class/pwm 不是 udev 设备（没有 uevent），改不了权限，所以这里没有 PWM 规则。
+# 风扇一律走 root 助手 zelux-fand（socket 0660 root:zelux），不要指望 zelux 直接写 sysfs。

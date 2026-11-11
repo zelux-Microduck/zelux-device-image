@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""zeluxd 启动器：把 /etc/zelux/zelux.toml 翻成环境变量，再 exec 真正的解释器。
+
+为什么要有这一层，而不是把参数写死在 systemd 单元里：
+1. 单元里的 Environment= 改一个端口就要 daemon-reload，现场没人记得；
+2. 单元和 TOML 两份配置必然会漂移，最后"网页读 8000、实际听 8001"这种问题查半天；
+3. 依赖装在 /opt/zelux/venv（第一次开机才建），用哪个 python 只能到运行期才知道。
+
+跑在哪：板子上，由 systemd 以 zelux 用户调用（ExecStart=/usr/local/bin/zeluxd-run）。
+会改动什么：什么都不改。只在内存里拼环境变量，然后 exec。
+退出码：78 = 配置/依赖没准备好（systemd 的 RestartPreventExitStatus 认这个数，不会反复重启刷日志）。
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+CONFIG_PATH = Path("/etc/zelux/zelux.toml")
+OPT_ROOT = Path("/opt/zelux")
+CURRENT = OPT_ROOT / "current"
+VENV_PYTHON = OPT_ROOT / "venv" / "bin" / "python"
+EX_CONFIG = 78                      # sysexits.h
+
+HINT = """\
+  · 依赖没装：sudo zelux-deps          （或 sudo zelux-deps --offline）
+  · 软件没装：sudo /path/to/image/install.sh
+  · 看日志：  sudo journalctl -u zeluxd -n 50 --no-pager
+"""
+
+
+def load_toml(path: Path) -> dict:
+    """读配置。缺文件不是错误（全部走默认值），语法错才是。"""
+    try:
+        import tomllib                  # 3.11+
+    except ModuleNotFoundError:          # pragma: no cover
+        sys.stderr.write("zeluxd-run: 需要 Python 3.11+（tomllib）。\n")
+        raise SystemExit(EX_CONFIG)
+    if not path.exists():
+        sys.stderr.write(f"zeluxd-run: 没有 {path}，全部用默认值\n")
+        return {}
+    with path.open("rb") as fh:
+        try:
+            return tomllib.load(fh)
+        except Exception as exc:
+            sys.stderr.write(f"zeluxd-run: {path} 语法错：{exc}\n")
+            raise SystemExit(EX_CONFIG)
+
+
+def as_hex(value, default: int) -> str:
+    """TOML 里的 0x52 会被读成十进制 82，config.py 要的是十六进制字符串。"""
+    try:
+        return hex(int(value))
+    except (TypeError, ValueError):
+        return hex(default)
+
+
+def build_env(cfg: dict) -> dict:
+    env = dict(os.environ)
+    sysc = cfg.get("system") or {}
+    i2c = cfg.get("i2c") or {}
+    servo = cfg.get("servo") or {}
+    tof = cfg.get("tof") or {}
+    fan = cfg.get("fan") or {}
+
+    env["ZELUX_MODE"] = "radxa"
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env.pop("PYTHONHOME", None)
+    # 没有 venv 时依赖装在 /opt/zelux/pylibs（zelux-deps 的退化路径），得让解释器找得到
+    pylib = OPT_ROOT / "pylibs"
+    if pylib.is_dir():
+        old = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(pylib) + (":" + old if old else "")
+
+    def put(key: str, value) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool):
+            env[key] = "1" if value else "0"
+        else:
+            env[key] = str(value)
+
+    put("ZELUX_HOST", sysc.get("host", "0.0.0.0"))
+    put("ZELUX_PORT", sysc.get("port", 8000))
+    put("ZELUX_STATE", sysc.get("state_dir", "/var/lib/zelux"))
+    put("ZELUX_PASSWORD", sysc.get("password", "zelux"))
+    put("ZELUX_SERVO_PORT", servo.get("port", "/dev/ttyS2"))
+    put("ZELUX_SERVO_BAUD", servo.get("baud", 1000000))
+    # 一个总线号：config.py 只有一个 i2c_bus，ToF/IMU 都挂在同一路
+    put("ZELUX_I2C_BUS", tof.get("bus", i2c.get("bus", 3)))
+    put("ZELUX_FAN_SOCK", fan.get("socket", "/run/zelux/fan.sock"))
+    # tof.addr 是"丝印地址"（8 位写地址 0x52），config.py 用 int(x, 16)
+    if "addr" in tof:
+        env["ZELUX_TOF_ADDR"] = as_hex(tof["addr"], 0x52)
+    return env
+
+
+def pick_python() -> str:
+    if VENV_PYTHON.exists() and os.access(VENV_PYTHON, os.X_OK):
+        return str(VENV_PYTHON)
+    return "/usr/bin/python3"
+
+
+def software_dir() -> Path:
+    """current/software 优先；退回到直接铺开的 /opt/zelux/software（手工解包的情况）。"""
+    for cand in (CURRENT / "software", OPT_ROOT / "software"):
+        if (cand / "zeluxd" / "app.py").is_file():
+            return cand.resolve()
+    return CURRENT / "software"
+
+
+def deps_missing(py: str) -> list[str]:
+    """用**将来真正跑服务**的那个解释器去探测，别用当前进程的。
+
+    install.sh 用系统 python3 调 --check，依赖却装在 venv 里；
+    在错误的解释器里 import 只会得出"没装"，然后让人去装第二遍。
+    """
+    code = ("import importlib.util as u,sys;"
+            "print(' '.join(m for m in ('fastapi','uvicorn') if u.find_spec(m) is None))")
+    import subprocess
+    try:
+        out = subprocess.run([py, "-c", code], capture_output=True, timeout=30,
+                             text=True, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return out.stdout.split()
+
+
+def check(cfg: dict) -> int:
+    sw = software_dir()
+    py = pick_python()
+    ok = True
+    print(f"配置      : {CONFIG_PATH} {'存在' if CONFIG_PATH.exists() else '缺失（用默认值）'}")
+    print(f"软件目录  : {sw} {'OK' if (sw / 'zeluxd' / 'app.py').is_file() else '缺失'}")
+    print(f"解释器    : {py}")
+    print(f"current   : {CURRENT} -> {os.path.realpath(CURRENT)}")
+    print(f"venv      : {'已装' if VENV_PYTHON.exists() else '未建（首启会建）'}")
+    missing = deps_missing(py)
+    print(f"依赖      : {'OK' if not missing else '缺 ' + ' '.join(missing)}")
+    web = sw / "web"
+    print(f"前端      : {web} {'OK' if web.is_dir() else '缺失（网页会 404，但服务能起）'}")
+    for label, cond in (("软件目录", (sw / "zeluxd" / "app.py").is_file()), ("依赖", not missing)):
+        if not cond:
+            ok = False
+            print(f"  ✗ {label} 不满足")
+    if not ok:
+        print("\n先把下面任意一件事做完：")
+        print(HINT.rstrip())
+        return EX_CONFIG
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    cfg = load_toml(CONFIG_PATH)
+    if "--print-env" in argv:
+        for k, v in sorted(build_env(cfg).items()):
+            if k.startswith("ZELUX_"):
+                print(f"{k}={v}")
+        return 0
+    if "--check" in argv:
+        return check(cfg)
+
+    env = build_env(cfg)
+    sw = software_dir()
+    if not (sw / "zeluxd" / "app.py").is_file():
+        sys.stderr.write(f"zeluxd-run: 找不到软件（{sw}/zeluxd/app.py）\n{HINT}")
+        return EX_CONFIG
+    py = pick_python()
+    missing = deps_missing(py)
+    if missing:
+        sys.stderr.write(f"zeluxd-run: {py} 里缺 Python 包：{' '.join(missing)}\n{HINT}")
+        return EX_CONFIG
+
+    os.chdir(sw)
+    try:
+        os.execve(py, [py, "run.py"], env)
+    except OSError as exc:
+        sys.stderr.write(f"zeluxd-run: 起不来：{exc}\n")
+        return EX_CONFIG
+    return 0                             # 不会走到这
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

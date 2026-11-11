@@ -1,0 +1,290 @@
+#!/bin/bash
+# ZELUX 升级：把新版本落到 /opt/zelux/releases/<ver>，然后只切一根软链
+#
+# 跑在哪：板子上（root）。zelux-update.service 用 --apply-staged 调它；
+#         现场也可以手动 `sudo zelux-update --check` / `--download 1.0.1`。
+# 要什么权限：root（写 /opt/zelux、重启 zeluxd）。
+# 会改动什么：
+#   /opt/zelux/releases/<ver>   新版本目录（不会覆盖旧版本，回滚就是切回去）
+#   /opt/zelux/current          软链（原子替换）
+#   /opt/zelux/VERSION
+#   /opt/zelux/.staged .previous 两个一行的状态文件
+#   必要时会跑 zelux-deps 装新依赖
+#
+# 用法：
+#   zelux-update --status            # 当前版本 / 可用版本 / 待安装版本
+#   zelux-update --check             # 问 GitHub 有没有新版本
+#   zelux-update --download <ver>    # 下载 + 校验 + 解包（不切换，只标记 staged）
+#   zelux-update --apply-staged      # 切换 + 装依赖 + 重启 + 失败自动回滚（幂等）
+#   zelux-update --local <tar.gz>    # 离线：从本地包安装（同样先 staged 再 apply）
+#   zelux-update --rollback          # 切回上一个版本
+#
+# 说明：先 staged 再 apply 是刻意的——下载可能断网、可能校验失败，
+# 那时候系统必须还在跑旧版本，绝对不能出现"切了一半"。
+set -euo pipefail
+
+readonly OPT_ROOT="/opt/zelux"
+readonly RELEASES="${OPT_ROOT}/releases"
+readonly CURRENT="${OPT_ROOT}/current"
+readonly STAGED="${OPT_ROOT}/.staged"
+readonly PREVIOUS="${OPT_ROOT}/.previous"
+readonly CONFIG="/etc/zelux/zelux.toml"
+readonly DL_DIR="${OPT_ROOT}/.download"
+
+log() { printf '[zelux-update] %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+# 只允许删 /opt/zelux 下面的路径（防止拼错变量把 / 干掉）
+safe_rm_tree() {
+    local target="${1:-}"
+    case "$target" in
+        "${OPT_ROOT}"/*) ;;
+        *) log "拒绝删除不认识的路径：${target:-<空>}"; return 1 ;;
+    esac
+    [ -d "$target" ] || return 0
+    rm -rf --one-file-system -- "$target"
+}
+
+current_version() {
+    cat "${OPT_ROOT}/VERSION" 2>/dev/null | head -1 || true
+}
+
+current_dir() {
+    readlink -f "$CURRENT" 2>/dev/null || true
+}
+
+cfg_get() {                             # cfg_get update github
+    local section="$1" key="$2"
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$CONFIG" "$section" "$key" <<'PY' || true
+import sys
+path, section, key = sys.argv[1:4]
+try:
+    import tomllib
+    with open(path, "rb") as fh:
+        cfg = tomllib.load(fh)
+    value = (cfg.get(section) or {}).get(key)
+    if value not in (None, ""):
+        print(value)
+except Exception:
+    pass
+PY
+}
+
+# ---------------------------------------------------------------- 原子切软链
+switch_to() {
+    local ver="$1" target="${RELEASES}/$1"
+    [ -d "$target" ] || die "没有这个版本目录：$target"
+    [ -f "$target/software/zeluxd/app.py" ] || die "$target 里没有 software/zeluxd/app.py，包是坏的"
+    local old
+    old="$(basename "$(current_dir)")"
+    ln -sfn "$target" "${CURRENT}.new"
+    mv -Tf "${CURRENT}.new" "$CURRENT"                # rename 是原子的，不会出现半截软链
+    printf '%s\n' "$ver" > "${OPT_ROOT}/VERSION.tmp"
+    mv -f "${OPT_ROOT}/VERSION.tmp" "${OPT_ROOT}/VERSION"
+    if [ -n "$old" ] && [ "$old" != "$ver" ] && [ "$old" != "." ]; then
+        printf '%s\n' "$old" > "$PREVIOUS"
+    fi
+    log "current -> releases/$ver（原 $old）"
+}
+
+restart_and_wait() {
+    systemctl restart zeluxd 2>/dev/null || { log "重启 zeluxd 失败"; return 1; }
+    local i
+    for i in $(seq 1 20); do
+        if systemctl is-active --quiet zeluxd; then
+            log "zeluxd 已在新版本上跑起来"
+            return 0
+        fi
+        sleep 1
+    done
+    log "zeluxd 20 秒内没起来"
+    systemctl status zeluxd --no-pager -l 2>&1 | tail -20 >&2 || true
+    return 1
+}
+
+# ---------------------------------------------------------------- apply
+apply_staged() {
+    [ -f "$STAGED" ] || { log "没有待安装版本，什么都不做"; return 0; }
+    local ver target prev req_old req_new
+    ver="$(head -1 "$STAGED")"
+    [ -n "$ver" ] || die "$STAGED 是空的"
+    target="${RELEASES}/${ver}"
+
+    prev="$(current_dir)"
+    req_old="${prev}/software/requirements.txt"
+    req_new="${target}/software/requirements.txt"
+
+    switch_to "$ver"
+
+    if [ -f "$req_new" ] && { [ ! -f "$req_old" ] || ! cmp -s "$req_old" "$req_new"; }; then
+        log "依赖清单变了，装依赖"
+        if ! /usr/local/bin/zelux-deps; then
+            log "装依赖失败，回滚"
+            [ -n "$prev" ] && switch_to "$(basename "$prev")"
+            return 1
+        fi
+    fi
+
+    if restart_and_wait; then
+        rm -f "$STAGED"
+        log "升级完成：$ver"
+        return 0
+    fi
+
+    log "新版本起不来，回滚到 $(basename "${prev:-?}")"
+    if [ -n "$prev" ]; then
+        switch_to "$(basename "$prev")"
+        restart_and_wait || log "回滚后仍然起不来，请接 HDMI / 看 journalctl -u zeluxd"
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------- 下载
+fetch_release() {
+    local ver="$1" repo asset url tmp
+    repo="$(cfg_get update github)"
+    [ -n "$repo" ] || die "没配更新源：在 ${CONFIG} 的 [update] github 填 owner/repo"
+    asset="$(cfg_get update asset)"
+    [ -n "$asset" ] || asset="zelux-duck-%s-arm64.tar.gz"
+    asset="${asset//%s/$ver}"          # 纯参数展开：不用 eval，也不怕模板里有别的 %
+
+    url="https://github.com/${repo}/releases/download/v${ver}/${asset}"
+    mkdir -p "$DL_DIR"
+    tmp="${DL_DIR}/${asset}"
+
+    log "下载 $url"
+    local auth=()
+    [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$tmp" "${auth[@]}" "$url" \
+        || die "下载失败（国内网络请用 --local 手动传包）"
+
+    if curl -fsSL "${auth[@]}" -o "${tmp}.sha256" "${url}.sha256" 2>/dev/null; then
+        verify_tarball "$tmp" "${tmp}.sha256" || die "校验失败，包可能损坏（已保留在 $tmp 供比对）"
+    else
+        die "release 里没有 ${asset}.sha256 —— 没有校验就不装"
+    fi
+    install_tarball "$tmp" "$ver"
+}
+
+verify_tarball() {
+    local file="$1" sumfile="$2" want got
+    want="$(awk '{print $1}' "$sumfile" 2>/dev/null | head -1)"
+    [ -n "$want" ] || { log "校验文件是空的"; return 1; }
+    got="$(sha256sum "$file" | awk '{print $1}')"
+    if [ "$want" != "$got" ]; then
+        log "sha256 不一致：期望 $want，实际 $got"
+        return 1
+    fi
+    log "sha256 OK（${got:0:16}…）"
+    return 0
+}
+
+install_tarball() {
+    local tarball="$1" ver="$2" tmpdir
+    [ -f "$tarball" ] || die "没有这个包：$tarball"
+    [ -n "$ver" ] || die "版本号是空的"
+    mkdir -p "$RELEASES"
+    if [ -d "${RELEASES}/${ver}/software/zeluxd" ]; then
+        log "releases/$ver 已经在了，直接复用它"
+        printf '%s\n' "$ver" > "$STAGED"
+        return 0
+    fi
+
+    tmpdir="${RELEASES}/.unpack-${ver}"
+    safe_rm_tree "$tmpdir" || die "清不掉临时目录"
+    mkdir -p "$tmpdir"
+    log "解包到 $tmpdir"
+    tar -xzf "$tarball" -C "$tmpdir" || die "解包失败（tar -tzf 看看包结构）"
+
+    # 允许两种包根：包内带一层 zelux-duck-<ver>/ 或直接 software/
+    local src="$tmpdir"
+    if [ ! -d "$src/software" ]; then
+        src="$(find "$tmpdir" -maxdepth 2 -type d -name software | head -1)"
+        [ -n "$src" ] || die "包里没有 software/ 目录"
+        src="$(dirname "$src")"
+    fi
+    mv "$src" "${RELEASES}/${ver}" || die "安装到 releases/$ver 失败"
+    # src 就是 tmpdir 时它已经被 mv 走了，这里只清理"包内还有一层目录"的情况
+    [ -d "$tmpdir" ] && { safe_rm_tree "$tmpdir" || true; }
+    printf '%s\n' "$ver" > "$STAGED"
+    log "已 staged：$ver（sudo systemctl start zelux-update 生效）"
+}
+
+# ---------------------------------------------------------------- check / status
+cmd_status() {
+    local cur staged prev
+    cur="$(current_version)"
+    staged="$(head -1 "$STAGED" 2>/dev/null || true)"
+    prev="$(head -1 "$PREVIOUS" 2>/dev/null || true)"
+    printf '已安装   : %s\n' "${cur:-未知}"
+    printf 'current  : %s\n' "$(current_dir)"
+    printf '待安装   : %s\n' "${staged:-无}"
+    printf '可回滚到 : %s\n' "${prev:-无}"
+    printf '本地版本 : %s\n' "$(ls -1 "$RELEASES" 2>/dev/null | grep -v '^\.' | tr '\n' ' ' || true)"
+}
+
+cmd_check() {
+    local repo latest cur
+    repo="$(cfg_get update github)"
+    [ -n "$repo" ] || die "没配更新源：在 ${CONFIG} 的 [update] github 填 owner/repo"
+    command -v curl >/dev/null 2>&1 || die "没有 curl"
+    latest="$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/${repo}/releases/latest" \
+              | tr ',' '\n' | awk -F'"' '/"tag_name"/{print $4; exit}')"
+    [ -n "$latest" ] || die "查不到最新版本（API 限流？手动看 https://github.com/${repo}/releases）"
+    cur="$(current_version)"
+    printf '当前 %s / 最新 %s\n' "${cur:-未知}" "${latest#v}"
+    if [ "${latest#v}" = "$cur" ]; then
+        log "已经是最新"
+    else
+        log "有新版本：sudo zelux-update --download ${latest#v}"
+    fi
+}
+
+# ---------------------------------------------------------------- main
+ACTION=""
+ARG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --status) ACTION=status; shift ;;
+        --check) ACTION=check; shift ;;
+        --apply-staged) ACTION=apply; shift ;;
+        --rollback) ACTION=rollback; shift ;;
+        --download) ACTION=download; ARG="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+        --local) ACTION=local; ARG="${2:-}"; shift; [ $# -gt 0 ] && shift || true ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        *) die "不认识的参数：$1" ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "要 root（sudo zelux-update ...）"
+[ -d "$OPT_ROOT" ] || die "$OPT_ROOT 不存在：这不是 ZELUX 镜像，先跑 install.sh"
+
+case "$ACTION" in
+    status) cmd_status ;;
+    check) cmd_check ;;
+    apply) apply_staged ;;
+    rollback)
+        prev="$(head -1 "$PREVIOUS" 2>/dev/null || true)"
+        [ -n "$prev" ] || die "没有可回滚的版本记录"
+        switch_to "$prev"
+        restart_and_wait || die "回滚后 zeluxd 还是起不来"
+        ;;
+    download)
+        [ -n "$ARG" ] || die "用法：zelux-update --download <版本号，例如 1.0.1>"
+        fetch_release "${ARG#v}"
+        ;;
+    local)
+        [ -n "$ARG" ] || die "用法：zelux-update --local <zelux-duck-x.y.z-arm64.tar.gz>"
+        [ -f "$ARG" ] || die "没有这个文件：$ARG"
+        if [ -f "${ARG}.sha256" ]; then
+            verify_tarball "$ARG" "${ARG}.sha256" || die "校验失败，不装"
+        else
+            log "警告：没有 ${ARG}.sha256，跳过校验（离线包请自己确认来源）"
+        fi
+        ver="$(basename "$ARG" | sed -n 's/^zelux-duck-\(.*\)-arm64\.tar\.gz$/\1/p')"
+        [ -n "$ver" ] || die "从文件名看不出 RFC 版本号，请重命名为 zelux-duck-<ver>-arm64.tar.gz"
+        install_tarball "$ARG" "$ver"
+        ;;
+    *) die "没给动作，看 --help" ;;
+esac

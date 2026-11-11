@@ -1,0 +1,20 @@
+[Unit]
+Description=ZELUX zeluxd self-heal (重启因缺依赖而放弃启动的 zeluxd)
+Documentation=file:///opt/zelux/current/software/README.md
+# 存在的理由：
+#   zeluxd.service 配了 RestartPreventExitStatus=78，意思是"依赖没装好就别反复重启刷日志"。
+#   但副作用是：如果它在首启装依赖之前就试过启动并退出 78，systemd 会记住"不再重试"，
+#   之后即使依赖装好了，它也一直停着 —— 表现就是热点能连、网页永远打不开。
+#   首启末尾虽然 restart 了一次，但如果那次刚好也赶上依赖没写完，就再也没有第二次机会。
+#
+#   这个 timer 每 60 秒看一次：zeluxd 该运行却没在运行（且不是人为 stop 的），就拉起来。
+#   它只做一件事，且永远不改配置，所以反复执行也无害。
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=zelux-selfheal.service
+
+[Install]
+WantedBy=timers.target

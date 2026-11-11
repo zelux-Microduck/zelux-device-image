@@ -1,0 +1,141 @@
+#!/bin/bash
+# 安装 zeluxd 的 Python 依赖（首启 / install.sh / 升级脚本共用这一个入口）
+#
+# 跑在哪：板子上（root），或 install.sh 里被调用。
+# 要什么权限：root（要建 /opt/zelux/venv 并可能 apt 装东西）。
+# 会改动什么：只写 /opt/zelux/venv（或退化到 /opt/zelux/pylibs），以及 apt 缓存。
+#
+# 用法：
+#   zelux-deps                  # 联网装（venv 优先，失败退化到 --target）
+#   zelux-deps --offline        # 只用 /opt/zelux/wheels（现场没网）
+#   zelux-deps --tof            # 顺带装 vl53l5cx-ctypes
+#   zelux-deps --mirror https://pypi.tuna.tsinghua.edu.cn/simple
+#   zelux-deps --check          # 只检查，不装
+set -euo pipefail
+
+readonly OPT_ROOT="/opt/zelux"
+readonly VENV="${OPT_ROOT}/venv"
+readonly PYLIB="${OPT_ROOT}/pylibs"
+readonly WHEELS="${OPT_ROOT}/wheels"
+readonly CURRENT="${OPT_ROOT}/current"
+readonly CONFIG="/etc/zelux/zelux.toml"
+
+OFFLINE=0
+WITH_TOF=0
+CHECK_ONLY=0
+MIRROR="${ZELUX_PIP_MIRROR:-}"
+
+log() { printf '[zelux-deps] %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --offline) OFFLINE=1; shift ;;
+        --tof) WITH_TOF=1; shift ;;
+        --check) CHECK_ONLY=1; shift ;;
+        --mirror) MIRROR="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+        *) die "不认识的参数：$1（--offline / --tof / --check / --mirror <url>）" ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "要 root（sudo zelux-deps）"
+
+REQ="${CURRENT}/software/requirements.txt"
+[ -f "$REQ" ] || die "找不到 $REQ：先跑 install.sh 或确认 /opt/zelux/current 软链"
+
+PY="/usr/bin/python3"
+command -v "$PY" >/dev/null 2>&1 || die "没有 /usr/bin/python3"
+
+python_has() {
+    local mod="$1"
+    if [ -x "${VENV}/bin/python" ]; then
+        "${VENV}/bin/python" -c "import ${mod}" >/dev/null 2>&1
+    else
+        PYTHONPATH="${PYLIB}" "$PY" -c "import ${mod}" >/dev/null 2>&1
+    fi
+}
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    if python_has fastapi && python_has uvicorn; then
+        log "依赖已就绪"
+        exit 0
+    fi
+    log "缺 fastapi / uvicorn"
+    exit 1
+fi
+
+# ---------------------------------------------------------------- 1. 解释器环境
+if [ ! -x "${VENV}/bin/python" ]; then
+    log "建 venv：$VENV"
+    # Debian 12 精简镜像经常没有 python3-venv，这里失败不致命（会退到 --target）
+    "$PY" -m venv "$VENV" >/dev/null 2>&1 || log "建 venv 失败（大概率缺 python3-venv），退化到 --target ${PYLIB}"
+fi
+
+PIP_FLAGS=()
+MODE="venv"
+if [ -x "${VENV}/bin/python" ] && "${VENV}/bin/python" -m pip --version >/dev/null 2>&1; then
+    PIP_CMD=("${VENV}/bin/python" -m pip)
+else
+    MODE="target"
+    mkdir -p "$PYLIB"
+    PIP_CMD=("$PY" -m pip)
+    # PEP 668：Debian 12 的系统 python 拒绝往系统目录装，加这个开关才允许 --target
+    PIP_FLAGS=(--target "$PYLIB" --break-system-packages)
+fi
+
+if ! "${PIP_CMD[@]}" --version >/dev/null 2>&1; then
+    log "没有可用的 pip。试 apt 的发行版包（不保证版本够新）"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends python3-fastapi python3-uvicorn \
+            || log "apt 装不上（现场没网就算了）"
+    fi
+    if python_has fastapi && python_has uvicorn; then
+        log "用系统 python3 包也能跑"
+        exit 0
+    fi
+    die "没有可用的 pip：apt install python3-pip python3-venv 后再跑一次"
+fi
+
+# ---------------------------------------------------------------- 2. 装
+ARGS=(--disable-pip-version-check --no-input -r "$REQ")
+if [ "$OFFLINE" -eq 1 ]; then
+    if [ ! -d "$WHEELS" ] || [ -z "$(ls -A "$WHEELS" 2>/dev/null)" ]; then
+        die "--offline 但没有 ${WHEELS}：构建镜像时加 --wheelhouse，或把轮子拷进来"
+    fi
+    ARGS+=(--no-index --find-links "$WHEELS")
+    log "离线安装（$WHEELS）"
+else
+    ARGS+=(--timeout 30 --retries 2)
+    if [ -n "$MIRROR" ]; then
+        ARGS+=(-i "$MIRROR")
+        log "使用镜像源：$MIRROR"
+    else
+        log "从默认源安装（国内慢可以加 --mirror https://pypi.tuna.tsinghua.edu.cn/simple）"
+    fi
+fi
+
+log "安装到 $MODE（这步可能要 1–3 分钟）"
+"${PIP_CMD[@]}" install "${PIP_FLAGS[@]}" "${ARGS[@]}"
+
+# ---------------------------------------------------------------- 3. ToF 驱动
+if [ "$WITH_TOF" -eq 1 ]; then
+    if python_has vl53l5cx_ctypes; then
+        log "vl53l5cx-ctypes 已存在"
+    else
+        log "安装 vl53l5cx-ctypes（VL53L5CX 的用户态固件驱动）"
+        TOF_ARGS=(--disable-pip-version-check --no-input vl53l5cx-ctypes)
+        if [ "$OFFLINE" -eq 1 ]; then
+            TOF_ARGS+=(--no-index --find-links "$WHEELS")
+        fi
+        "${PIP_CMD[@]}" install "${PIP_FLAGS[@]}" "${TOF_ARGS[@]}" \
+            || log "装失败：ToF 会显示 unsupported，其它功能不受影响"
+    fi
+fi
+
+# ---------------------------------------------------------------- 4. 校验
+if python_has fastapi && python_has uvicorn; then
+    log "好了（$MODE）"
+    exit 0
+fi
+die "装完还是 import 不到 fastapi/uvicorn：看上面的 pip 报错"
