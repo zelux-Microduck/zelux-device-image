@@ -1,12 +1,14 @@
 param(
     [string]$Agent = (Join-Path $PSScriptRoot '..\..\zelux-device-agent'),
     [string]$Studio = (Join-Path $PSScriptRoot '..\..\zelux-studio'),
+    [string]$Drivers = (Join-Path $PSScriptRoot '..\..\zelux-device-drivers'),
     [string]$Output = (Join-Path $PSScriptRoot '..\components')
 )
 
 $ErrorActionPreference = 'Stop'
 $agentRoot = (Resolve-Path -LiteralPath $Agent).Path
 $studioRoot = (Resolve-Path -LiteralPath $Studio).Path
+$driversRoot = (Resolve-Path -LiteralPath $Drivers).Path
 $outputRoot = [IO.Path]::GetFullPath($Output)
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $outputRoot.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar)) {
@@ -18,6 +20,7 @@ if (Test-Path -LiteralPath $outputRoot) {
 }
 New-Item -ItemType Directory -Path (Join-Path $outputRoot 'software') -Force | Out-Null
 Copy-Item -Path (Join-Path $agentRoot 'software\*') -Destination (Join-Path $outputRoot 'software') -Recurse
+Copy-Item -LiteralPath (Join-Path $driversRoot 'src\zelux_drivers') -Destination (Join-Path $outputRoot 'software') -Recurse
 New-Item -ItemType Directory -Path (Join-Path $outputRoot 'software\web') -Force | Out-Null
 Get-ChildItem -LiteralPath $studioRoot -Force |
     Where-Object { $_.Name -ne '.git' } |

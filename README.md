@@ -3,7 +3,7 @@
 ZELUX 设备镜像、增量安装、首启服务和烧写工具。本仓库不再拥有 Studio、Agent
 或驱动源代码；正式构建应按 `components.lock.yaml` 下载并校验各组件 Release。
 
-开发环境先装配独立组件：
+开发环境先装配独立 Agent、Studio 和 Drivers 组件：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/assemble-components.ps1
