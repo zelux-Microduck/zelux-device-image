@@ -29,6 +29,7 @@ set -euo pipefail
 readonly PROG="${0##*/}"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+readonly COMPONENT_ROOT="${ZELUX_COMPONENT_ROOT:-$SCRIPT_DIR/components}"
 readonly STATE_DIR="/var/lib/zelux"
 readonly BACKUP_ROOT="$STATE_DIR/backup"
 readonly OPT_ROOT="/opt/zelux"
@@ -150,11 +151,13 @@ resolve_src() {
 
     # 单元目录：仓库里在 software/systemd，包里在 units/
     SRC_UNITS="$SRC_ROOT/units"
+    [ -d "$SRC_UNITS" ] || SRC_UNITS="$COMPONENT_ROOT/software/systemd"
     [ -d "$SRC_UNITS" ] || SRC_UNITS="$SRC_ROOT/../software/systemd"
     [ -d "$SRC_UNITS" ] || die "找不到 systemd 单元目录（units/ 或 software/systemd）"
 
     # 软件目录：包里 $SRC_ROOT/software，仓库里 $SRC_ROOT/../software
     SRC_SOFTWARE="$SRC_ROOT/software"
+    [ -d "$SRC_SOFTWARE" ] || SRC_SOFTWARE="$COMPONENT_ROOT/software"
     [ -d "$SRC_SOFTWARE" ] || SRC_SOFTWARE="$SRC_ROOT/../software"
     [ -d "$SRC_SOFTWARE" ] || die "找不到 software 目录"
 
@@ -167,21 +170,22 @@ resolve_src() {
 
 # ---------------------------------------------------------------- 打包（开发机用）
 do_pack() {
-    [ -d "$REPO_ROOT/image/overlay" ] || die "--pack 要在仓库里跑（找不到 image/overlay）"
-    VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/image/VERSION")"
+    [ -d "$SCRIPT_DIR/overlay" ] || die "--pack 要在镜像仓库里跑（找不到 overlay）"
+    [ -d "$COMPONENT_ROOT/software/zeluxd" ] || die "缺少 components；先运行 tools/assemble-components.sh"
+    VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
     local stage name out
     stage="$(mktemp -d "${TMPDIR:-/tmp}/zelux-pack.XXXXXX")"
     name="zelux-duck-${VERSION}"
     mkdir -p "$stage/$name"
-    cp -a "$REPO_ROOT/image/overlay" "$stage/$name/overlay"
-    cp -a "$REPO_ROOT/software/systemd" "$stage/$name/units"
+    cp -a "$SCRIPT_DIR/overlay" "$stage/$name/overlay"
+    cp -a "$COMPONENT_ROOT/software/systemd" "$stage/$name/units"
     mkdir -p "$stage/$name/software"
     # 不带 __pycache__ / 本地状态：包里只放要跑的东西
-    tar -C "$REPO_ROOT/software" \
+    tar -C "$COMPONENT_ROOT/software" \
         --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' --exclude='var' \
         -cf - . | tar -C "$stage/$name/software" -xf -
     printf '%s\n' "$VERSION" > "$stage/$name/VERSION"
-    cp "$REPO_ROOT/image/install.sh" "$stage/$name/install.sh" 2>/dev/null || true
+    cp "$SCRIPT_DIR/install.sh" "$stage/$name/install.sh" 2>/dev/null || true
     chmod 755 "$stage/$name/install.sh" 2>/dev/null || true
     out="$PWD/${name}-arm64.tar.gz"
     tar -C "$stage" -czf "$out" "$name" || die "打包失败"

@@ -20,7 +20,8 @@
 set -euo pipefail
 
 BASE=${BASE:-/root/off.img}
-SRC=${SRC:-/mnt/d/迅雷下载/zelux-src}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SRC=${SRC:-$SCRIPT_DIR/components}
 WHEELS=${WHEELS:-/root/wh313}
 WORK=${WORK:-/root/zb5}
 NEWSIZE=${NEWSIZE:-5G}

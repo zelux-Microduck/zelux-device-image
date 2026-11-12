@@ -1,0 +1,7 @@
+components/
+build/
+out/
+*.img
+*.img.xz
+*.tar.gz
+*.sha256

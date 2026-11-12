@@ -27,10 +27,10 @@ set -euo pipefail
 
 readonly PROG="${0##*/}"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+readonly COMPONENT_ROOT="${ZELUX_COMPONENT_ROOT:-$SCRIPT_DIR/components}"
 readonly OVERLAY_DIR="$SCRIPT_DIR/overlay"
-readonly UNITS_DIR="$REPO_ROOT/software/systemd"
-readonly SOFTWARE_DIR="$REPO_ROOT/software"
+readonly UNITS_DIR="$COMPONENT_ROOT/software/systemd"
+readonly SOFTWARE_DIR="$COMPONENT_ROOT/software"
 readonly VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
 
 # 构建工作区（可复用；每次会删掉里面的旧 img）
