@@ -1,0 +1,8 @@
+schema: zelux.components-lock/v1
+image: 1.0.0
+protocol: 1.1.0
+studio: 1.0.0
+agent: 1.0.0
+drivers:
+  bundle: builtin-1.0.0
+motiond: external
