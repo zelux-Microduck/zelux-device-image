@@ -1,5 +1,7 @@
 # ZELUX Device Image
 
+当前跨仓库完成状态、未完成内容和恢复开发入口见 [项目阶段状态](docs/PROJECT_STATUS.md)。
+
 ZELUX 设备镜像、增量安装、首启服务和烧写工具。本仓库不再拥有 Studio、Agent
 或驱动源代码；正式构建应按 `components.lock.yaml` 下载并校验各组件 Release。
 
