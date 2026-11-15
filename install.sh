@@ -382,6 +382,11 @@ apply_perms() {
 
 ensure_user() {
     step "用户与分组"
+    # Shared IPC group used by robotd's IMU socket. Create it here too so the Studio service
+    # remains startable when the device image is installed before the separate robotd release.
+    if ! getent group robot >/dev/null 2>&1; then
+        groupadd -r robot 2>/dev/null || warn "创建 robot 组失败；robotd IMU IPC 将不可用"
+    fi
     if id zelux >/dev/null 2>&1; then
         log "zelux 用户已存在"
     else

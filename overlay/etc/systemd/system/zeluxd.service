@@ -16,6 +16,8 @@ After=network.target zelux-fand.service
 Type=simple
 User=zelux
 Group=zelux
+# robotd owns the IMU datagram socket and grants write access to its robot group.
+SupplementaryGroups=robot
 # /opt/zelux/current → releases/<版本>，升级只切软链，进程跟着重启
 WorkingDirectory=/opt/zelux/current/software
 Environment=ZELUX_MODE=radxa
