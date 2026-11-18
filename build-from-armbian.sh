@@ -120,6 +120,10 @@ log "已挂载，可用空间：$(df -h "$MNT" | awk 'NR==2{print $4}')"
 # ---------------------------------------------------------------------- 3
 step "3/10 注入 overlay（ZELUX 的脚本 / 单元 / 配置）"
 cp -a "$SRC/overlay/." "$MNT/"
+# Keep boot executables runnable when the source checkout was assembled on Windows.
+for script in "$SRC/overlay/usr/local/bin/"* "$SRC/overlay/usr/local/sbin/"*; do
+    [ ! -f "$script" ] || sed -i 's/\r$//' "$MNT/${script#"$SRC/overlay/"}"
+done
 log "overlay 文件数：$(find "$SRC/overlay" -type f | wc -l)"
 
 # ---------------------------------------------------------------------- 4

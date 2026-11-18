@@ -9,3 +9,5 @@ jobs:
         with: {python-version: "3.11"}
       - run: python tools/validate-lock.py
       - run: bash -n build-image.sh build-from-armbian.sh install.sh tools/assemble-components.sh
+      - name: Check boot scripts use LF line endings
+        run: python tools/validate-linux-payload.py

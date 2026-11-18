@@ -403,6 +403,12 @@ inject_overlay() {
     require_rootfs
     step "注入 overlay"
     rsync -aHAX --numeric-ids "$OVERLAY_DIR/" "$MNT/"
+    # A Windows working tree can still contain CRLF despite the checkout attributes.
+    # Normalize the image copies only; do not rewrite the developer's source checkout.
+    local script
+    for script in "$OVERLAY_DIR/usr/local/bin/"* "$OVERLAY_DIR/usr/local/sbin/"*; do
+        [ ! -f "$script" ] || sed -i 's/\r$//' "$MNT/${script#"$OVERLAY_DIR/"}"
+    done
     # 单元文件以 software/systemd 为唯一真源（overlay 里那份是给"手工 rsync"用的副本）
     local f b
     for f in "$UNITS_DIR"/*.service; do

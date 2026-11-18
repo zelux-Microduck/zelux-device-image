@@ -1,0 +1,3 @@
+# Keep Linux deployment payloads Unix-native in Windows checkouts and packages.
+*.sh text eol=lf
+overlay/** text eol=lf

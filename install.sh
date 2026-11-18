@@ -178,6 +178,10 @@ do_pack() {
     name="zelux-duck-${VERSION}"
     mkdir -p "$stage/$name"
     cp -a "$SCRIPT_DIR/overlay" "$stage/$name/overlay"
+    # Normalize Linux boot executables in the artifact, leaving the source checkout untouched.
+    for script in "$stage/$name/overlay/usr/local/bin/"* "$stage/$name/overlay/usr/local/sbin/"*; do
+        [ ! -f "$script" ] || sed -i 's/\r$//' "$script"
+    done
     cp -a "$COMPONENT_ROOT/software/systemd" "$stage/$name/units"
     mkdir -p "$stage/$name/software"
     # 不带 __pycache__ / 本地状态：包里只放要跑的东西
@@ -325,6 +329,11 @@ install_files() {
 
     step "写入 overlay（/etc /usr/local）"
     rsync -aHAX --numeric-ids --exclude 'opt/zelux/README.md' "$SRC_OVERLAY/" "/"
+    # A package may have been assembled from a Windows checkout. Normalize installed copies so
+    # a subsequent service start cannot fail because of a CRLF shebang.
+    for script in "$SRC_OVERLAY/usr/local/bin/"* "$SRC_OVERLAY/usr/local/sbin/"*; do
+        [ ! -f "$script" ] || sed -i 's/\r$//' "/${script#"$SRC_OVERLAY/"}"
+    done
 
     step "写入 systemd 单元（以 software/systemd 为准）"
     for f in "$SRC_UNITS"/*.service; do
