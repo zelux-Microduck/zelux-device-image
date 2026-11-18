@@ -5,3 +5,4 @@ studio: 1.2.0
 agent: 1.3.0
 drivers: 1.1.0
 motiond: external
+fan: local-snapshot

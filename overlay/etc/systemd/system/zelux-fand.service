@@ -1,22 +1,29 @@
 [Unit]
 Description=ZELUX fan helper (root PWM side of /run/zelux/fan.sock)
-Documentation=file:///opt/zelux/current/software/zeluxd/hal/radxa_fan.py
+Documentation=file:///opt/zelux/current/software/zelux-fan/fanctl
 # 风扇要在 zeluxd 之前就转起来：主板在无人看管的十几秒里也能上 80℃。
 Before=zeluxd.service
+Conflicts=fanctl.service
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 # 必须是 root：/sys/class/pwm 只有 root 能写。这是全系统唯一一个常驻 root 进程，
-# 代码在 usr/local/bin/fanctl，只做「读一行 JSON → 写 duty」这一件事。
+# 代码在 /opt/zelux/current/software/zelux-fan/fanctl，只做「读一行 JSON → 写 duty」这一件事。
 User=root
 Group=zelux
-ExecStart=/usr/local/bin/fanctl --serve --config /etc/zelux/zelux.toml
+ExecStart=/opt/zelux/current/software/zelux-fan/fanctl --serve --config /etc/zelux/zelux.toml
+# Environment for legacy config migration and socket access
+Environment=FANCTL_INVENTORY_FILE=/var/lib/zelux-fan/inventory.json
+Environment=FANCTL_SOCKET_GROUP=zelux
 # 目录归 root:zelux 0750，socket 由 fanctl 自己 chmod 0660
 RuntimeDirectory=zelux
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
+# State directory for fan inventory migration
+StateDirectory=zelux-fan
+StateDirectoryMode=0750
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
@@ -27,7 +34,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
-ReadWritePaths=/run/zelux
+ReadWritePaths=/run/zelux /var/lib/zelux-fan
 
 [Install]
 WantedBy=multi-user.target

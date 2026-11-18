@@ -42,34 +42,41 @@ addr = 0x52
 hz = 15
 
 [fan]
+# Fresh installs do not guess fan count or pins. Add verified instances in Studio.
+# Existing deployed channel configuration is preserved and migrated on upgrade.
+channel = []
 # zeluxd 以 zelux 用户跑，改不了 /sys/class/pwm，所以调速走这个 root 助手的 socket
 socket = "/run/zelux/fan.sock"
+# Socket group ownership (zelux group gets read/write access)
+socket_group = "zelux"
 # 25 kHz：40000 ns 周期。Feetech 舵机对低频 PWM 很敏感，别乱改
 period_ns = 40000
 # fanctl 启动时先给的安全风速。zeluxd 起来后会按温度曲线接管。
 default_pct = 60
+# Persistent inventory for fan migration (migrates fan.channel records on first run)
+inventory_file = "/var/lib/zelux-fan/inventory.json"
 
 # 风扇 1：PWM14 / GPIO3_C4（全局 116），没有测速线
-[[fan.channel]]
-name = "顶部风扇"
-pwm = 14
-gpio = 116
-tach = 0
+# [[fan.channel]]
+# name = "顶部风扇"
+# pwm = 14
+# gpio = 116
+# tach = 0
 # sysfs 里通道号是 chip 内偏移，不是全局号。
 # TODO 真机确认：RK3566 一般 4 通道/chip，pwm14 → pwmchip3 的 pwm2。
 # 不确定就把 chip 和 channel 都写 -1，让 fanctl 只找内核已经导出的通道（不 export，绝对不会动错脚）。
-chip = 3
-channel = 2
+# chip = 3
+# channel = 2
 
 # 风扇 2：PWM12 / GPIO4_C6（全局 149，接口丝印 GPIO4_C6/PIN_24）+ 测速 GPIO150
-[[fan.channel]]
-name = "主板散热"
-pwm = 12
-gpio = 149
-tach = 150
+# [[fan.channel]]
+# name = "主板散热"
+# pwm = 12
+# gpio = 149
+# tach = 150
 # TODO 真机确认：pwm12 → pwmchip3 的 pwm0
-chip = 3
-channel = 0
+# chip = 3
+# channel = 0
 
 [wifi]
 # 兜底热点：30 秒内没连上任何已知 WiFi 就开它（NetworkManager 的 shared 模式，192.168.4.1）

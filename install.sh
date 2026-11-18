@@ -249,10 +249,10 @@ backup_file() {
     fi
 }
 
-# 只允许回滚 /etc /usr/local /opt/zelux 下的路径（防手滑）
+# 只允许回滚 /etc /usr/local /opt/zelux /var/lib/zelux-fan 下的路径（防手滑）
 path_allowed() {
     case "$1" in
-        /etc/*|/usr/local/*|"$OPT_ROOT"/*) return 0 ;;
+        /etc/*|/usr/local/*|"$OPT_ROOT"/*|/var/lib/zelux-fan/*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -324,16 +324,34 @@ install_files() {
         [ -n "$rel" ] || continue
         backup_file "$rel"
     done < "$BACKUP/planned.txt"
+    # Backup fan inventory for migration rollback
+    backup_file "/var/lib/zelux-fan/inventory.json"
     ROLLBACK_ARMED=1
     log "已备份 $(grep -c '^file' "$MANIFEST" 2>/dev/null || echo 0) 个文件到 $BACKUP"
 
     step "写入 overlay（/etc /usr/local）"
-    rsync -aHAX --numeric-ids --exclude 'opt/zelux/README.md' "$SRC_OVERLAY/" "/"
+    # Exclude zelux.toml from rsync to preserve user PWM mappings during upgrade.
+    # The template config is installed below only if the file doesn't already exist.
+    rsync -aHAX --numeric-ids \
+        --exclude 'opt/zelux/README.md' \
+        --exclude 'etc/zelux/zelux.toml' \
+        "$SRC_OVERLAY/" "/"
     # A package may have been assembled from a Windows checkout. Normalize installed copies so
     # a subsequent service start cannot fail because of a CRLF shebang.
     for script in "$SRC_OVERLAY/usr/local/bin/"* "$SRC_OVERLAY/usr/local/sbin/"*; do
         [ ! -f "$script" ] || sed -i 's/\r$//' "/${script#"$SRC_OVERLAY/"}"
     done
+
+    # Install template config only for brand-new installs (preserve existing user config)
+    if [ ! -f "/etc/zelux/zelux.toml" ]; then
+        mkdir -p /etc/zelux
+        if [ -f "$SRC_OVERLAY/etc/zelux/zelux.toml" ]; then
+            install -D -m 0644 "$SRC_OVERLAY/etc/zelux/zelux.toml" "/etc/zelux/zelux.toml"
+            log "已安装默认配置 /etc/zelux/zelux.toml"
+        fi
+    else
+        log "保留现有配置 /etc/zelux/zelux.toml（升级不覆盖）"
+    fi
 
     step "写入 systemd 单元（以 software/systemd 为准）"
     for f in "$SRC_UNITS"/*.service; do
@@ -415,6 +433,9 @@ ensure_user() {
     chown zelux:zelux "$STATE_DIR" "$STATE_DIR/models" "$STATE_DIR/shots" 2>/dev/null || true
     chmod 750 "$STATE_DIR"
     chmod 700 "$STATE_DIR/backup" 2>/dev/null || true
+    # Fan inventory directory (root-owned, managed by zelux-fand)
+    mkdir -p /var/lib/zelux-fan
+    chmod 755 /var/lib/zelux-fan 2>/dev/null || true
 }
 
 configure_network() {
