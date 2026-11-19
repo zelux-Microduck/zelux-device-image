@@ -216,12 +216,18 @@ check_preflight() {
         *) warn "当前架构是 $arch，不是 aarch64：能装，但服务很可能起不来（镜像目标是 Radxa Zero 3W）" ;;
     esac
     if [ -r /etc/os-release ]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        [ "${ID:-}" = "debian" ] || warn "系统是 ${PRETTY_NAME:-未知}，不是 Debian（脚本按 bookworm 写）"
+        # 注意：必须在子 shell 里读。/etc/os-release 也有 VERSION=，直接 source 会把
+        # 安装版本号覆盖成 "13 (trixie)" 这种系统版本，版本目录名跟着变形。
+        local os_id os_pretty
+        os_id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")"
+        os_pretty="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-未知}")"
+        [ "$os_id" = "debian" ] || warn "系统是 $os_pretty，不是 Debian（脚本按 bookworm 写）"
     fi
 
-    [ -d "$OPT_ROOT" ] && [ -e "$OPT_ROOT/current" ] && log "检测到已有安装，按升级处理（旧版本目录会保留）"
+    # 全新板子上 /opt/zelux/current 不存在，注意不能让它把 set -e 触发成静默退出
+    if [ -d "$OPT_ROOT" ] && [ -e "$OPT_ROOT/current" ]; then
+        log "检测到已有安装，按升级处理（旧版本目录会保留）"
+    fi
 }
 
 confirm() {
