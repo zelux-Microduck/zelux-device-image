@@ -10,13 +10,15 @@ After=network-online.target
 [Service]
 Type=simple
 # 必须是 root：/sys/class/pwm 只有 root 能写。这是全系统唯一一个常驻 root 进程，
-# 代码在 /opt/zelux/current/software/zelux-fan/fanctl，只做「读一行 JSON → 写 duty」这一件事。
+# 代码在 /opt/zelux/current/software/zelux-fan/fanctl，独占 PWM/FG runtime；
+# 仅逻辑 pin 档案绑定的实例可 export PWM，所有权持久记账。
 User=root
 Group=zelux
 ExecStart=/opt/zelux/current/software/zelux-fan/fanctl --serve --config /etc/zelux/zelux.toml
 # Environment for legacy config migration and socket access
 Environment=FANCTL_INVENTORY_FILE=/var/lib/zelux-fan/inventory.json
 Environment=FANCTL_SOCKET_GROUP=zelux
+Environment=FANCTL_PWM_OWNERSHIP_FILE=/var/lib/zelux-fan/pwm-owned.json
 # 目录归 root:zelux 0750，socket 由 fanctl 自己 chmod 0660
 RuntimeDirectory=zelux
 RuntimeDirectoryMode=0750

@@ -140,12 +140,12 @@ check_tools() {
     local missing=()
     local t
     for t in xz losetup parted partx e2fsck resize2fs rsync blkid findmnt sha256sum \
-             stat truncate install awk sed grep mount umount lsblk; do
+             stat truncate install awk sed grep mount umount lsblk dtc sha256sum; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
         die "缺工具：${missing[*]}
-     Debian/Ubuntu：sudo apt install -y xz-utils rsync parted e2fsprogs util-linux coreutils gdisk"
+     Debian/Ubuntu：sudo apt install -y xz-utils rsync parted e2fsprogs util-linux coreutils gdisk device-tree-compiler"
     fi
     command -v sgdisk >/dev/null 2>&1 || warn "没有 sgdisk（gdisk 包）：GPT 扩容时备份表可能不迁移，能用但建议装上"
     command -v systemctl >/dev/null 2>&1 || warn "宿主机没有 systemctl：跳过离线 enable 检查"
@@ -409,6 +409,8 @@ inject_overlay() {
     for script in "$OVERLAY_DIR/usr/local/bin/"* "$OVERLAY_DIR/usr/local/sbin/"*; do
         [ ! -f "$script" ] || sed -i 's/\r$//' "$MNT/${script#"$OVERLAY_DIR/"}"
     done
+    mkdir -p "$MNT/usr/local/libexec"
+    install -D -m 0755 "$SCRIPT_DIR/tools/build-pwm-overlays.sh" "$MNT/usr/local/libexec/zelux-build-pwm-overlays"
     # 单元文件以 software/systemd 为唯一真源（overlay 里那份是给"手工 rsync"用的副本）
     local f b
     for f in "$UNITS_DIR"/*.service; do
@@ -916,7 +918,7 @@ enable_units() {
     mkdir -p "$wants"
     # 手写软链而不是 systemctl --root：不依赖宿主 systemd 版本，结果可预期
     local u
-    for u in zeluxd zelux-fand zelux-firstboot; do
+    for u in zeluxd zelux-fand zelux-pwm-setupd zelux-firstboot; do
         ln -sfn "/etc/systemd/system/${u}.service" "$wants/${u}.service"
     done
     # sshd / NetworkManager：官方镜像一般已经开了，缺了就补
@@ -930,7 +932,7 @@ enable_units() {
     done
     # zelux-update 是 oneshot，故意**不** enable（只能人工/OTA 触发）
     rm -f "$wants/zelux-update.service"
-    log "已 enable：zeluxd zelux-fand zelux-firstboot"
+    log "已 enable：zeluxd zelux-fand zelux-pwm-setupd zelux-firstboot"
 }
 
 wheelhouse() {
@@ -1001,6 +1003,7 @@ verify_units() {
     if systemd-analyze verify \
         "$MNT"/etc/systemd/system/zeluxd.service \
         "$MNT"/etc/systemd/system/zelux-fand.service \
+        "$MNT"/etc/systemd/system/zelux-pwm-setupd.service \
         "$MNT"/etc/systemd/system/zelux-firstboot.service \
         "$MNT"/etc/systemd/system/zelux-update.service >/tmp/zelux-verify.log 2>&1; then
         log "zelux-*.service 通过"
@@ -1326,6 +1329,7 @@ main() {
     step "6/10 注入 overlay + 软件"
     inject_overlay
     install_software
+    "$MNT/usr/local/libexec/zelux-build-pwm-overlays" "$MNT${BOOT_MNT_REL:-/boot}" "$MNT" "$SCRIPT_DIR/device-tree/overlays"
 
     step "7/10 用户 / 目录 / cloud-init / 串口 / 设备树 / 桌面"
     create_user

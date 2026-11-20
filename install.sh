@@ -33,7 +33,7 @@ readonly COMPONENT_ROOT="${ZELUX_COMPONENT_ROOT:-$SCRIPT_DIR/components}"
 readonly STATE_DIR="/var/lib/zelux"
 readonly BACKUP_ROOT="$STATE_DIR/backup"
 readonly OPT_ROOT="/opt/zelux"
-readonly UNITS_ENABLED="zeluxd zelux-fand zelux-firstboot"
+readonly UNITS_ENABLED="zeluxd zelux-fand zelux-pwm-setupd zelux-firstboot"
 
 MODE="install"          # install | pack | rollback
 DEV_MODE=0
@@ -178,6 +178,11 @@ do_pack() {
     name="zelux-duck-${VERSION}"
     mkdir -p "$stage/$name"
     cp -a "$SCRIPT_DIR/overlay" "$stage/$name/overlay"
+    # Offline installs run install.sh from this archive, so include the
+    # allowlisted PWM overlay compiler and its trusted DTS inputs as well.
+    mkdir -p "$stage/$name/tools" "$stage/$name/device-tree"
+    install -m 0755 "$SCRIPT_DIR/tools/build-pwm-overlays.sh" "$stage/$name/tools/build-pwm-overlays.sh"
+    cp -a "$SCRIPT_DIR/device-tree/overlays" "$stage/$name/device-tree/overlays"
     # Normalize Linux boot executables in the artifact, leaving the source checkout untouched.
     for script in "$stage/$name/overlay/usr/local/bin/"* "$stage/$name/overlay/usr/local/sbin/"*; do
         [ ! -f "$script" ] || sed -i 's/\r$//' "$script"
@@ -347,6 +352,7 @@ install_files() {
     for script in "$SRC_OVERLAY/usr/local/bin/"* "$SRC_OVERLAY/usr/local/sbin/"*; do
         [ ! -f "$script" ] || sed -i 's/\r$//' "/${script#"$SRC_OVERLAY/"}"
     done
+    install -D -m 0755 "$SRC_ROOT/tools/build-pwm-overlays.sh" /usr/local/libexec/zelux-build-pwm-overlays
 
     # Install template config only for brand-new installs (preserve existing user config)
     if [ ! -f "/etc/zelux/zelux.toml" ]; then
@@ -371,6 +377,10 @@ install_files() {
     rsync -aHAX --numeric-ids \
         --exclude '__pycache__/' --exclude '*.pyc' --exclude '.pytest_cache/' --exclude 'var/' \
         "$SRC_SOFTWARE/" "$rel_dir/software/"
+    if [ -d "$SRC_ROOT/device-tree/overlays" ] && [ -f /boot/armbianEnv.txt ]; then
+        command -v dtc >/dev/null 2>&1 || die "设备树配置需要 dtc；请先安装 device-tree-compiler"
+        /usr/local/libexec/zelux-build-pwm-overlays /boot /usr "$SRC_ROOT/device-tree/overlays"
+    fi
     if [ ! -d "$rel_dir/software/web" ]; then
         mkdir -p "$rel_dir/software/web"
         printf '<!doctype html><meta charset="utf-8"><title>ZELUX</title><body style="font:16px system-ui;background:#0B0F14;color:#F6F8FA;padding:40px"><h1 style="color:#00D8A0">ZELUX Duck Studio</h1><p>后端在跑，但这台机器上没有前端文件（software/web）。</p></body>\n' \
@@ -442,6 +452,9 @@ ensure_user() {
     # Fan inventory directory (root-owned, managed by zelux-fand)
     mkdir -p /var/lib/zelux-fan
     chmod 755 /var/lib/zelux-fan 2>/dev/null || true
+    mkdir -p /var/lib/zelux-pwm-setup
+    chown root:root /var/lib/zelux-pwm-setup
+    chmod 700 /var/lib/zelux-pwm-setup
 }
 
 configure_network() {
@@ -474,6 +487,7 @@ enable_services() {
         systemctl enable "$u.service" >/dev/null 2>&1 || warn "enable $u 失败"
     done
     systemctl restart zelux-fand.service || warn "zelux-fand 起不来（风扇会不转，看 journal）"
+    systemctl restart zelux-pwm-setupd.service || warn "zelux-pwm-setupd 起不来（Studio 不能自动配置 PWM overlay）"
     if [ "$DO_RESTART" -eq 1 ]; then
         systemctl restart zeluxd.service || warn "zeluxd 重启失败"
     fi

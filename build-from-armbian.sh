@@ -64,7 +64,7 @@ step "0/10 前置检查"
 [ -d "$SRC/overlay" ] || die "找不到 $SRC/overlay"
 [ -d "$SRC/software" ] || die "找不到 $SRC/software"
 [ -d "$WHEELS" ] || die "找不到离线轮子目录 $WHEELS（cp313 aarch64）"
-for t in sgdisk sfdisk e2fsck resize2fs xz; do
+for t in sgdisk sfdisk e2fsck resize2fs xz dtc sha256sum; do
     command -v "$t" >/dev/null 2>&1 || die "宿主缺 $t"
 done
 
@@ -124,6 +124,8 @@ cp -a "$SRC/overlay/." "$MNT/"
 for script in "$SRC/overlay/usr/local/bin/"* "$SRC/overlay/usr/local/sbin/"*; do
     [ ! -f "$script" ] || sed -i 's/\r$//' "$MNT/${script#"$SRC/overlay/"}"
 done
+mkdir -p "$MNT/usr/local/libexec"
+install -D -m 0755 "$SCRIPT_DIR/tools/build-pwm-overlays.sh" "$MNT/usr/local/libexec/zelux-build-pwm-overlays"
 log "overlay 文件数：$(find "$SRC/overlay" -type f | wc -l)"
 
 # ---------------------------------------------------------------------- 4
@@ -131,6 +133,7 @@ step "4/10 注入 software 到 /opt/zelux/releases/$VERSION"
 REL="$MNT/opt/zelux/releases/$VERSION"
 mkdir -p "$REL" "$MNT/opt/zelux/releases"
 cp -a "$SRC/software/." "$REL/software/"
+"$MNT/usr/local/libexec/zelux-build-pwm-overlays" "$MNT/boot" "$MNT" "$SCRIPT_DIR/device-tree/overlays"
 rm -rf "$REL/software/var"
 ln -sfn "releases/$VERSION" "$MNT/opt/zelux/current"
 printf '%s\n' "$VERSION" > "$MNT/opt/zelux/VERSION"
@@ -312,7 +315,7 @@ find "$MNT/etc/NetworkManager/system-connections" -name "*.nmconnection" -exec c
 find "$MNT/etc/NetworkManager/system-connections" -name "*.nmconnection" -exec chown 0:0 {} + 2>/dev/null || true
 
 # 开服务（手写软链，不依赖宿主 systemd 版本）
-for u in zeluxd zelux-fand zelux-firstboot; do
+for u in zeluxd zelux-fand zelux-pwm-setupd zelux-firstboot; do
     ln -sfn "/etc/systemd/system/$u.service" "$WANTS/$u.service"
 done
 rm -f "$WANTS/zelux-update.service"    # oneshot，只能人工/OTA 触发
@@ -327,7 +330,7 @@ if [ -f "$MNT/etc/systemd/system/zelux-selfheal.timer" ]; then
 else
     warn "缺 zelux-selfheal.timer —— 没有自愈兜底"
 fi
-log "已 enable：zeluxd zelux-fand zelux-firstboot"
+log "已 enable：zeluxd zelux-fand zelux-pwm-setupd zelux-firstboot"
 
 # ---------------------------------------------------------------------- 9
 step "9/10 自检（不通过就不出包）"

@@ -7,7 +7,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
+      - name: Install device-tree compiler
+        run: sudo apt-get update && sudo apt-get install -y device-tree-compiler
       - run: python tools/validate-lock.py
-      - run: bash -n build-image.sh build-from-armbian.sh install.sh tools/assemble-components.sh
+      - run: bash -n build-image.sh build-from-armbian.sh install.sh tools/assemble-components.sh tools/build-pwm-overlays.sh
+      - name: Run image helper and overlay packaging tests
+        run: python -m unittest discover -s tests -v
       - name: Check boot scripts use LF line endings
         run: python tools/validate-linux-payload.py

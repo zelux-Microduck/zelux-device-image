@@ -1,0 +1,39 @@
+[Unit]
+Description=ZELUX restricted PWM device-tree setup helper
+Documentation=file:///opt/zelux/current/software/zelux-device-image/docs/fan-pwm-first-enable.md
+Before=zeluxd.service
+After=local-fs.target
+Wants=zelux-fand.service
+After=zelux-fand.service
+
+[Service]
+Type=simple
+User=root
+Group=zelux
+ExecStart=/usr/bin/python3 /usr/local/sbin/zelux-pwm-setupd --socket /run/zelux/pwm-setup.sock --group zelux
+RuntimeDirectory=zelux
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=zelux-pwm-setup
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# Boot configuration is this helper's explicit responsibility. Avoid the implicit
+# /boot read-only mount from ProtectSystem on the target vendor systemd/kernel.
+# Keep the other ProtectSystem=full directories read-only explicitly instead.
+ProtectSystem=no
+ReadOnlyPaths=/usr /etc -/efi
+ReadWritePaths=/boot /run/zelux /var/lib/zelux-pwm-setup
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

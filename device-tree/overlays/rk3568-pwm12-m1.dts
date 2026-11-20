@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0
+// Source: radxa/overlays, commit bba8c5214481f607066fe2c227d1e9942daf19e2
+// Radxa Zero 3 pin 21: PWM12-M1 (exclusive GPIO4_C5).
+/dts-v1/;
+/plugin/;
+
+/ {
+	metadata {
+		title = "Enable PWM12-M1";
+		compatible = "radxa,rock-3a", "radxa,rock-3b", "radxa,rock-3c", "radxa,zero3";
+		category = "misc";
+		exclusive = "GPIO4_C5";
+		description = "Enable PWM12-M1 on Radxa ZERO 3 pin 21.";
+	};
+};
+
+&pwm12 {
+	status = "okay";
+	pinctrl-names = "active";
+	pinctrl-0 = <&pwm12m1_pins>;
+};

@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""Restricted Armbian PWM overlay setup helper for the Radxa Zero 3 profile."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import difflib
+import grp
+import hashlib
+import json
+import os
+import re
+import secrets
+import signal
+import stat
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+API_VERSION = 1
+PROFILE = "radxa-zero3-armbian-rk35xx-pwm.v1"
+PIN_OVERLAYS = {
+    "radxa-zero3w-pin21-pwm12-m1": (21, "PWM12_M1", "pwm12", "pwm12m1_pins", "rk3568-pwm12-m1"),
+    "radxa-zero3w-pin24-pwm13-m1": (24, "PWM13_M1", "pwm13", "pwm13m1_pins", "rk3568-pwm13-m1"),
+}
+TOKEN_TTL_S = 120
+MAX_LINE = 4096
+
+
+def is_zero3w(model: str, compatible: list[str]) -> bool:
+    """Recognize upstream and legacy Armbian DT identities, never a generic SoC."""
+    name = "".join(c for c in model.lower() if c.isalnum())
+    ids = {c.lower() for c in compatible}
+    if "radxazero3e" in name or any("zero3e" in c.replace("-", "") for c in ids):
+        return False
+    boards = {"radxa,zero3", "radxa,zero3-aic8800ds2", "radxa,zero-3w"}
+    if ids:
+        return "rockchip,rk3566" in ids and bool(ids & boards)
+    return name == "radxazero3w"
+
+
+class SetupError(Exception):
+    pass
+
+
+class SetupManager:
+    """Allowlisted, testable operations; no request can supply a path or command."""
+
+    def __init__(self, *, boot_env=Path("/boot/armbianEnv.txt"),
+                 overlay_dir=Path("/boot/overlay-user"),
+                 manifest=Path("/usr/share/zelux/pwm-overlays.sha256"),
+                 state_dir=Path("/var/lib/zelux-pwm-setup"),
+                 model_file=Path("/proc/device-tree/model"),
+                 symbols_root=Path("/proc/device-tree/__symbols__"),
+                 tree_root=Path("/proc/device-tree"),
+                 pwm_root=Path("/sys/class/pwm"), kernel_release=None,
+                 boot_id_file=Path("/proc/sys/kernel/random/boot_id"),
+                 armbian_release=Path("/etc/armbian-release")):
+        self.boot_env = Path(boot_env)
+        self.overlay_dir = Path(overlay_dir)
+        self.manifest = Path(manifest)
+        self.state_dir = Path(state_dir)
+        self.model_file = Path(model_file)
+        self.symbols_root = Path(symbols_root)
+        self.tree_root = Path(tree_root)
+        self.pwm_root = Path(pwm_root)
+        self.boot_id_file = Path(boot_id_file)
+        self.kernel_release = kernel_release or os.uname().release
+        self.armbian_release = Path(armbian_release)
+        self._previews: dict[str, tuple[str, float, str, str]] = {}
+
+    def _boot_id(self) -> str:
+        return self._read_text(self.boot_id_file)
+
+    def _pending_reboot(self) -> dict:
+        try:
+            value = json.loads((self.state_dir / "pending-reboot.json").read_text("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _pending_record(self, pin_id: str) -> dict:
+        pending = self._pending_reboot()
+        pins = pending.get("pins")
+        if isinstance(pins, dict) and isinstance(pins.get(pin_id), dict):
+            return pins[pin_id]
+        # Accept state written by the first helper revision during upgrade.
+        return pending if pending.get("pin_id") == pin_id else {}
+
+    def _remove_pending_pin(self, pin_id: str) -> None:
+        pending = self._pending_reboot()
+        pins = pending.get("pins")
+        if isinstance(pins, dict):
+            pins.pop(pin_id, None)
+            if pins:
+                self._write_pending_state({"pins": pins})
+                return
+        try:
+            (self.state_dir / "pending-reboot.json").unlink()
+        except FileNotFoundError:
+            pass
+
+    def _write_pending_state(self, value: dict) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        target = self.state_dir / "pending-reboot.json"
+        fd, temp_name = tempfile.mkstemp(prefix=".pending-reboot.", dir=str(self.state_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_name, target)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+
+    def _write_pending_reboot(self, pin_id: str, action: str = "enable") -> None:
+        old = self._pending_reboot()
+        pins = old.get("pins") if isinstance(old.get("pins"), dict) else {}
+        if not pins and old.get("pin_id") and old.get("boot_id"):
+            pins[old["pin_id"]] = {"boot_id": old["boot_id"], "applied_at": old.get("applied_at", "")}
+        pins[pin_id] = {"boot_id": self._boot_id(), "action": action,
+                        "applied_at": datetime.now(timezone.utc).isoformat()}
+        self._write_pending_state({"pins": pins})
+
+    def _model(self) -> str:
+        try:
+            return self.model_file.read_bytes().decode("utf-8", "replace").replace("\0", "").strip()
+        except OSError:
+            return ""
+
+    def _profile_error(self) -> str:
+        compatible = self._compatible()
+        if not is_zero3w(self._model(), compatible):
+            return ("未识别 Radxa Zero 3W 板卡档案；不对 Zero 3E 或其他变体猜测引脚映射"
+                    f"（model={self._model()!r}, compatible={compatible!r}）")
+        if "rk35xx" not in self.kernel_release or not self.kernel_release.startswith("6.1."):
+            return "当前内核不在已支持的 Armbian 6.1 vendor-rk35xx 档案内"
+        if not self.armbian_release.is_file():
+            return "未检测到 Armbian 系统标记"
+        try:
+            boot_cmd = (self.boot_env.parent / "boot.cmd").read_text("utf-8", errors="replace")
+        except OSError:
+            return "无法检查 Armbian boot.cmd overlay 支持能力"
+        if "overlay_error" not in boot_cmd or "user_overlays" not in boot_cmd or "overlay-user" not in boot_cmd:
+            return "当前 boot.cmd 未确认包含 user_overlays/overlay-user 加载逻辑"
+        extlinux = self.boot_env.parent / "extlinux" / "extlinux.conf"
+        if extlinux.is_file():
+            try:
+                text = extlinux.read_text("utf-8", errors="replace")
+            except OSError:
+                return "发现 extlinux.conf 但无法判断启动配置；拒绝修改可能未生效的 armbianEnv.txt"
+            if re.search(r"(?m)^\s*fdtoverlays\s+", text):
+                return "发现 extlinux fdtoverlays 启动配置；当前 helper 仅支持 Armbian boot.scr，拒绝改写另一套启动配置"
+        return ""
+
+    def _symbol_node(self, name: str) -> Path | None:
+        try:
+            rel = self.symbols_root.joinpath(name).read_bytes().decode("ascii").strip("\0\n")
+        except OSError:
+            return None
+        if not rel.startswith("/") or ".." in Path(rel).parts:
+            return None
+        return self.tree_root.joinpath(rel.lstrip("/"))
+
+    def _compatible(self) -> list[str]:
+        try:
+            return [v for v in (self.tree_root / "compatible").read_bytes().decode(
+                "utf-8", "replace").strip("\0").split("\0") if v]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _read_text(path: Path, default="") -> str:
+        try:
+            return path.read_bytes().decode("utf-8", "replace").strip("\0\n\r ")
+        except OSError:
+            return default
+
+    def _tree_mapping(self, pin_id: str) -> dict:
+        _, function, controller_symbol, pinctrl_symbol, _ = PIN_OVERLAYS[pin_id]
+        controller = self._symbol_node(controller_symbol)
+        pinctrl = self._symbol_node(pinctrl_symbol)
+        if not controller or not controller.is_dir() or not pinctrl or not pinctrl.is_dir():
+            return {"compatible": False, "reason": "当前运行设备树缺少该 PWM 控制器或 pinmux 符号"}
+        status = self._read_text(controller / "status", "okay")
+        names = self._read_text(controller / "pinctrl-names")
+        ctrl_pin = (controller / "pinctrl-0")
+        pin_phandle = pinctrl / "phandle"
+        try:
+            ctrl_refs = ctrl_pin.read_bytes()
+            pin_ref = pin_phandle.read_bytes()
+            active = (status == "okay" and names.split()[:1] == ["active"]
+                      and len(pin_ref) == 4 and pin_ref in ctrl_refs)
+        except OSError:
+            active = False
+        chip_entry = None
+        try:
+            expected_node = controller.resolve()
+            for chip in self.pwm_root.glob("pwmchip*"):
+                of_node = chip / "device" / "of_node"
+                try:
+                    if of_node.resolve() == expected_node:
+                        chip_entry = {"chip": int(chip.name[7:]),
+                                      "npwm": int((chip / "npwm").read_text("ascii").strip()),
+                                      "exported": (chip / "pwm0").exists(),
+                                      "device": (chip / "device").resolve().name}
+                        break
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            pass
+        # PWM export belongs exclusively to fanctl at instance activation time.
+        ready = bool(active and chip_entry and chip_entry["npwm"] > 0)
+        return {"compatible": True, "pinctrl_active": active,
+                "controller_path": str(controller), "controller": chip_entry,
+                "ready": ready, "reason": "" if ready else
+                ("PWM pinmux 尚未在运行设备树中生效" if not active else
+                 "PWM 控制器尚未就绪")}
+
+    def _manifest_hash(self, overlay_id: str) -> str | None:
+        filename = overlay_id + ".dtbo"
+        try:
+            for line in self.manifest.read_text("ascii").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lstrip("*./") == filename and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                    return parts[0]
+        except OSError:
+            return None
+        return None
+
+    def _overlay_available(self, overlay_id: str) -> bool:
+        expected = self._manifest_hash(overlay_id)
+        path = self.overlay_dir / (overlay_id + ".dtbo")
+        if not expected or not path.is_file() or path.is_symlink():
+            return False
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest() == expected
+        except OSError:
+            return False
+
+    def _config(self) -> tuple[str, str, list[str]]:
+        try:
+            raw = self.boot_env.read_bytes()
+        except OSError as exc:
+            raise SetupError(f"无法读取 Armbian 启动配置：{exc}") from None
+        text = raw.decode("utf-8", "strict")
+        newline = "\r\n" if "\r\n" in text else "\n"
+        matches = [line for line in text.splitlines() if re.match(r"^\s*user_overlays\s*=", line)]
+        if len(matches) > 1:
+            raise SetupError("armbianEnv.txt 存在重复 user_overlays 项，拒绝自动修改")
+        entries = []
+        if matches:
+            value = matches[0].split("=", 1)[1].split("#", 1)[0]
+            entries = value.split()
+            if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", item) for item in entries):
+                raise SetupError("user_overlays 含不支持的条目格式，拒绝自动修改")
+        return text, newline, entries
+
+    def _runtime_and_status(self) -> dict:
+        profile_error = self._profile_error()
+        current_boot_id = self._boot_id()
+        pins = []
+        configured_any = False
+        ready_any = False
+        for pin_id, (number, function, controller, pinctrl, overlay_id) in PIN_OVERLAYS.items():
+            try:
+                _, _, entries = self._config()
+            except SetupError as exc:
+                entries = []
+                config_error = str(exc)
+            else:
+                config_error = ""
+            configured = overlay_id in entries
+            configured_any |= configured
+            overlay_ok = self._overlay_available(overlay_id)
+            tree = self._tree_mapping(pin_id) if not profile_error else {
+                "compatible": False, "ready": False, "reason": profile_error}
+            ready = bool(tree.get("ready"))
+            ready_any |= ready
+            pending_pin = self._pending_record(pin_id)
+            boot_changed = bool(pending_pin.get("boot_id") and current_boot_id
+                                and pending_pin.get("boot_id") != current_boot_id)
+            if profile_error:
+                state, reason = "unsupported", profile_error
+            elif config_error:
+                state, reason = "config_error", config_error
+            elif not overlay_ok:
+                state, reason = "overlay_missing", "设备镜像中缺少或校验失败的受信 PWM overlay"
+            elif not tree.get("compatible"):
+                state, reason = "incompatible_base", tree.get("reason", "设备树不兼容")
+            elif pending_pin.get("action") == "rollback":
+                if not boot_changed:
+                    state, reason = "rollback_reboot_required", "回滚配置已保存，重启后确认 PWM overlay 已卸载"
+                elif configured or ready:
+                    state, reason = "rollback_failed", "重启后 PWM overlay 仍处于活动状态；请检查其他启动配置或设备树来源"
+                    self._remove_pending_pin(pin_id)
+                else:
+                    state, reason = "overlay_required", "回滚已在重启后验证；如仍需此引脚，可重新预览配置"
+                    self._remove_pending_pin(pin_id)
+            elif ready:
+                state, reason = "runtime_available", "设备树 pinmux 与 PWM 控制器已就绪；通道由风扇服务按需导出"
+                if self._pending_record(pin_id):
+                    self._remove_pending_pin(pin_id)
+            elif configured:
+                if boot_changed:
+                    state, reason = "validation_failed", "设备已重启，但运行设备树未启用该 PWM pinmux；请检查 overlay/启动日志，或回滚配置"
+                else:
+                    state, reason = "reboot_required", "PWM overlay 已写入启动配置，重启后将自动验证"
+            else:
+                state, reason = "overlay_required", tree.get("reason") or "等待启用 PWM overlay"
+            pins.append({"id": pin_id, "label": f"pin {number} · {function}",
+                         "pin": number, "function": function, "channel": 0,
+                         "overlay_id": overlay_id, "overlay_available": overlay_ok,
+                         "configured": configured, "ready": ready, "state": state,
+                         "reason": reason, "chip": (tree.get("controller") or {}).get("chip"),
+                         "device": (tree.get("controller") or {}).get("device"),
+                         "pinctrl_active": tree.get("pinctrl_active", False)})
+        if ready_any:
+            overall, reason = "runtime_available", "至少一个物理 PWM 引脚已验证可运行"
+        elif any(p["state"] == "reboot_required" for p in pins):
+            overall, reason = "reboot_required", "PWM 配置已保存，重启后验证"
+        elif any(p["state"] == "rollback_reboot_required" for p in pins):
+            overall, reason = "rollback_reboot_required", "回滚已保存，重启后验证"
+        elif any(p["state"] == "validation_failed" for p in pins):
+            overall, reason = "validation_failed", "设备已重启，但至少一个已配置 PWM 引脚未通过验证"
+        elif any(p["state"] == "rollback_failed" for p in pins):
+            overall, reason = "rollback_failed", "重启后仍检测到 PWM overlay 活动，请检查其他配置来源"
+        elif any(p["state"] == "overlay_required" for p in pins):
+            overall, reason = "overlay_required", "存在已验证 overlay，可从 Studio 启用"
+        elif profile_error:
+            overall, reason = "unsupported", profile_error
+        else:
+            overall, reason = "unavailable", "当前设备环境不满足 PWM 自动配置条件"
+        return {"profile": PROFILE, "board": self._model(), "compatible": self._compatible(),
+                "kernel": self.kernel_release, "state": overall,
+                "reason": reason, "overlay_supported": any(p["overlay_available"] for p in pins),
+                "reboot_required": overall in ("reboot_required", "rollback_reboot_required"), "mapped_pins": pins}
+
+    def status(self) -> dict:
+        return self._runtime_and_status()
+
+    def preview(self, pin_id: str) -> dict:
+        if pin_id not in PIN_OVERLAYS:
+            raise SetupError("未知 PWM 物理引脚档案")
+        status = self._runtime_and_status()
+        pin = next(p for p in status["mapped_pins"] if p["id"] == pin_id)
+        if pin["state"] == "runtime_available":
+            return {"state": "runtime_available", "pin": pin, "diff": "", "reason": pin["reason"]}
+        if pin["state"] != "overlay_required":
+            raise SetupError(pin["reason"])
+        old, newline, entries = self._config()
+        overlay_id = pin["overlay_id"]
+        new = old
+        if overlay_id not in entries:
+            lines = old.splitlines()
+            index = next((i for i, line in enumerate(lines) if re.match(r"^\s*user_overlays\s*=", line)), None)
+            if index is None:
+                if new and not new.endswith(("\n", "\r")):
+                    new += newline
+                new += f"user_overlays={overlay_id}{newline}"
+            else:
+                line = lines[index]
+                prefix, value = line.split("=", 1)
+                comment = ""
+                if "#" in value:
+                    value, marker, tail = value.partition("#")
+                    comment = marker + tail
+                updated = (value.rstrip() + " " + overlay_id).strip()
+                lines[index] = prefix + "=" + updated + ((" " if comment and not comment.startswith(" ") else "") + comment if comment else "")
+                new = newline.join(lines) + (newline if old.endswith(("\n", "\r")) else "")
+        token = secrets.token_urlsafe(24)
+        base_hash = hashlib.sha256(old.encode("utf-8")).hexdigest()
+        self._previews[token] = (pin_id, time.monotonic() + TOKEN_TTL_S, new, base_hash)
+        diff = "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                            fromfile="/boot/armbianEnv.txt", tofile="/boot/armbianEnv.txt (proposed)"))
+        return {"state": "preview", "pin_id": pin_id, "overlay_id": overlay_id,
+                "token": token, "expires_in_s": TOKEN_TTL_S, "diff": diff,
+                "backup": "将备份到 /var/lib/zelux-pwm-setup/", "reboot_required": True}
+
+    def apply(self, pin_id: str, token: str, confirm: bool) -> dict:
+        pending = self._previews.pop(token, None)
+        if not confirm or not pending or pending[0] != pin_id or pending[1] < time.monotonic():
+            raise SetupError("确认凭据无效或已过期，请重新生成配置预览")
+        if self._profile_error():
+            raise SetupError(self._profile_error())
+        if not self._overlay_available(PIN_OVERLAYS[pin_id][4]):
+            raise SetupError("受信 PWM overlay 已不可用，请重新检查镜像")
+        current, _, entries = self._config()
+        overlay_id = PIN_OVERLAYS[pin_id][4]
+        if overlay_id in entries:
+            return {"state": "reboot_required", "already_configured": True,
+                    "pin_id": pin_id, "reboot_required": True}
+        desired = pending[2]
+        if current == desired:
+            return {"state": "reboot_required", "already_configured": True,
+                    "pin_id": pin_id, "reboot_required": True}
+        if hashlib.sha256(current.encode("utf-8")).hexdigest() != pending[3]:
+            raise SetupError("启动配置在预览后发生变化；为避免覆盖其他修改，请重新生成预览")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = self.state_dir / f"armbianEnv.{stamp}.{secrets.token_hex(3)}.bak"
+        backup.write_bytes(current.encode("utf-8"))
+        os.chmod(backup, 0o600)
+        data = desired.encode("utf-8")
+        current_mode = stat.S_IMODE(self.boot_env.stat().st_mode)
+        fd, temp_name = tempfile.mkstemp(prefix=".armbianEnv.", dir=str(self.boot_env.parent))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temp_name, current_mode)
+            os.replace(temp_name, self.boot_env)
+            if os.name == "posix":
+                dir_fd = os.open(self.boot_env.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+        try:
+            self._write_pending_reboot(pin_id)
+        except OSError as exc:
+            try:
+                self._atomic_write(current)
+            except OSError as rollback_exc:
+                raise SetupError(f"无法记录重启验证状态（{exc}），且恢复启动配置失败（{rollback_exc}）；请使用备份恢复") from None
+            raise SetupError(f"无法记录重启验证状态，启动配置已恢复：{exc}") from None
+        return {"state": "reboot_required", "pin_id": pin_id,
+                "overlay_id": overlay_id, "backup": str(backup),
+                "reboot_required": True}
+
+    def rollback(self, pin_id: str, confirm: bool) -> dict:
+        if not confirm or pin_id not in PIN_OVERLAYS:
+            raise SetupError("回滚需要明确确认并提供已知 PWM 引脚")
+        profile_error = self._profile_error()
+        if profile_error:
+            raise SetupError(profile_error)
+        runtime = self._tree_mapping(pin_id)
+        if runtime.get("ready"):
+            raise SetupError("该物理 PWM 引脚当前已在运行设备树中生效；为避免中断正在使用的风扇，不能在线回滚")
+        _, _, _, _, overlay_id = PIN_OVERLAYS[pin_id]
+        old, newline, entries = self._config()
+        if overlay_id not in entries:
+            self._remove_pending_pin(pin_id)
+            return {"state": "unchanged", "reboot_required": False}
+        lines = old.splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*user_overlays\s*=", line):
+                prefix, value = line.split("=", 1)
+                body, marker, comment = value.partition("#")
+                kept = [item for item in body.split() if item != overlay_id]
+                lines[i] = prefix + "=" + " ".join(kept) + ((" #" + comment.lstrip()) if marker else "")
+        new = newline.join(lines) + (newline if old.endswith(("\n", "\r")) else "")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = self.state_dir / f"armbianEnv.rollback.{stamp}.{secrets.token_hex(3)}.bak"
+        backup.write_text(old, encoding="utf-8")
+        os.chmod(backup, 0o600)
+        self._atomic_write(new)
+        try:
+            self._write_pending_reboot(pin_id, action="rollback")
+        except OSError as exc:
+            try:
+                self._atomic_write(old)
+            except OSError as restore_exc:
+                raise SetupError(f"回滚状态写入失败（{exc}），且恢复启动配置失败（{restore_exc}）；备份：{backup}") from None
+            raise SetupError(f"回滚验证状态无法保存，启动配置已恢复；备份：{backup}") from None
+        return {"state": "reboot_required", "removed_overlay": overlay_id,
+                "backup": str(backup), "reboot_required": True}
+
+    def _atomic_write(self, content: str) -> None:
+        mode = stat.S_IMODE(self.boot_env.stat().st_mode)
+        fd, temp_name = tempfile.mkstemp(prefix=".armbianEnv.", dir=str(self.boot_env.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temp_name, mode)
+            os.replace(temp_name, self.boot_env)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+
+    def handle(self, req: dict) -> dict:
+        try:
+            if req.get("api_version") != API_VERSION:
+                raise SetupError("PWM setup API 版本不兼容")
+            op = req.get("op")
+            if op == "status":
+                return {"api_version": API_VERSION, "ok": True, "pwm_setup": self.status()}
+            if op == "preview":
+                return {"api_version": API_VERSION, "ok": True, "preview": self.preview(req.get("pin_id", ""))}
+            if op == "apply":
+                return {"api_version": API_VERSION, "ok": True,
+                        "result": self.apply(req.get("pin_id", ""), req.get("token", ""), req.get("confirm") is True)}
+            if op == "rollback":
+                return {"api_version": API_VERSION, "ok": True,
+                        "result": self.rollback(req.get("pin_id", ""), req.get("confirm") is True)}
+            raise SetupError("不支持的 PWM setup 操作")
+        except SetupError as exc:
+            return {"api_version": API_VERSION, "ok": False, "code": "setup_denied", "error": str(exc)}
+        except (OSError, ValueError) as exc:
+            return {"api_version": API_VERSION, "ok": False, "code": "setup_failed", "error": str(exc)}
+
+
+async def serve(manager: SetupManager, socket_path: Path, socket_group: str):
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        pass
+    server = await asyncio.start_unix_server(
+        lambda r, w: handle_client(manager, r, w), path=str(socket_path), limit=MAX_LINE)
+    os.chmod(socket_path, 0o660)
+    os.chown(socket_path, 0, grp.getgrnam(socket_group).gr_gid)
+    async with server:
+        await server.serve_forever()
+
+
+async def handle_client(manager, reader, writer):
+    try:
+        line = await asyncio.wait_for(reader.readline(), 3.0)
+        if not line or len(line) > MAX_LINE:
+            response = {"api_version": API_VERSION, "ok": False,
+                        "code": "invalid_request", "error": "请求为空或超过长度限制"}
+        else:
+            try:
+                req = json.loads(line)
+                response = manager.handle(req) if isinstance(req, dict) else {
+                    "api_version": API_VERSION, "ok": False,
+                    "code": "invalid_request", "error": "请求必须是 JSON object"}
+            except (ValueError, UnicodeDecodeError):
+                response = {"api_version": API_VERSION, "ok": False,
+                            "code": "invalid_request", "error": "JSON 请求无效"}
+        writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode())
+        await writer.drain()
+    except (OSError, asyncio.TimeoutError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket", default="/run/zelux/pwm-setup.sock")
+    parser.add_argument("--group", default="zelux")
+    args = parser.parse_args()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    task = loop.create_task(serve(SetupManager(), Path(args.socket), args.group))
+    try:
+        loop.run_until_complete(stop.wait())
+    finally:
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

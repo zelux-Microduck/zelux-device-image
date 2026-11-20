@@ -8,8 +8,8 @@ Documentation=file:///opt/zelux/current/software/README.md
 #      就能接客。上游通不通只影响"板子能不能访问外网"，与网页能不能打开无关。
 #   所以：只 Wants（不阻塞），并把 After 收紧到 basic 级。
 #   首启末尾会 restart zeluxd 一次，兜住"依赖后装"的情况。
-Wants=zelux-fand.service zelux-firstboot.service
-After=network.target zelux-fand.service
+Wants=zelux-fand.service zelux-pwm-setupd.service zelux-firstboot.service
+After=network.target zelux-fand.service zelux-pwm-setupd.service
 # 同一份代码在本机（sim）也能跑，所以这里不依赖任何图形界面 / seat / dbus 会话。
 
 [Service]
