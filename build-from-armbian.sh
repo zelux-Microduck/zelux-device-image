@@ -59,6 +59,7 @@ pick_loop() {
 
 # ---------------------------------------------------------------------- 0
 step "0/10 前置检查"
+python3 "$SCRIPT_DIR/tools/robotd_component.py" verify --source "$SRC/robotd" --lock "$SRC/components.lock.yaml"
 [ "$(id -u)" -eq 0 ] || die "要 root"
 [ -f "$BASE" ] || die "找不到基底镜像 $BASE"
 [ -d "$SRC/overlay" ] || die "找不到 $SRC/overlay"
@@ -133,6 +134,7 @@ step "4/10 注入 software 到 /opt/zelux/releases/$VERSION"
 REL="$MNT/opt/zelux/releases/$VERSION"
 mkdir -p "$REL" "$MNT/opt/zelux/releases"
 cp -a "$SRC/software/." "$REL/software/"
+python3 "$SCRIPT_DIR/tools/robotd_component.py" install --source "$SRC/robotd" --root "$MNT" --lock "$SRC/components.lock.yaml"
 "$MNT/usr/local/libexec/zelux-build-pwm-overlays" "$MNT/boot" "$MNT" "$SCRIPT_DIR/device-tree/overlays"
 rm -rf "$REL/software/var"
 ln -sfn "releases/$VERSION" "$MNT/opt/zelux/current"
@@ -192,7 +194,7 @@ mkdir -p "$WANTS"
 # 必须屏蔽，否则 zeluxd 绑端口失败，外网看到的还是旧界面。
 MASK_LIST="microduck-studio microduck-firstboot microduck-netcheck \
 microduck-update-control microduck-updater-engine microduck-voice-prepare \
-duck-echo robotd robot-boot-check mediad padd tofd btd configd updaterd"
+duck-echo robot-boot-check mediad padd tofd btd configd updaterd"
 masked=0
 for u in $MASK_LIST; do
     if [ -e "$MNT/etc/systemd/system/$u.service" ] || [ -e "$MNT/usr/lib/systemd/system/$u.service" ] || [ -e "$MNT/lib/systemd/system/$u.service" ]; then

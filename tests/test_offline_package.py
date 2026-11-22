@@ -29,6 +29,11 @@ class OfflinePackageTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env["ZELUX_COMPONENT_ROOT"] = str(component_root)
+            env['ZELUX_PYTHON'] = __import__('sys').executable
+            from test_robotd_integration import fixture
+            robot_sha = fixture(component_root / 'robotd')
+            (component_root / 'components.lock.yaml').write_text(
+                'robotd: 1.2.3\nrobotd_manifest_sha256: ' + robot_sha + '\n')
             subprocess.run(
                 [BASH, str(ROOT / "install.sh"), "--pack"],
                 cwd=tmp,
@@ -46,6 +51,12 @@ class OfflinePackageTests(unittest.TestCase):
 
         required = {
             f"{package_name}/install.sh",
+            f"{package_name}/robotd/bin/robotd",
+            f"{package_name}/robotd/bin/robotctl",
+            f"{package_name}/robotd/lib/libonnxruntime.so",
+            f"{package_name}/robotd/systemd/robotd.service",
+            f"{package_name}/tools/robotd_component.py",
+            f"{package_name}/components.lock.yaml",
             f"{package_name}/tools/build-pwm-overlays.sh",
             f"{package_name}/device-tree/overlays/rk3568-pwm12-m1.dts",
             f"{package_name}/device-tree/overlays/rk3568-pwm13-m1.dts",

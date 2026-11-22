@@ -1250,6 +1250,7 @@ EOF
 
 # ---------------------------------------------------------------- 主流程
 main() {
+    python3 "$SCRIPT_DIR/tools/robotd_component.py" verify --source "$COMPONENT_ROOT/robotd" --lock "$COMPONENT_ROOT/components.lock.yaml"
     check_platform
     [ "$DRY_RUN" -eq 1 ] || check_root
     check_tools
@@ -1329,6 +1330,7 @@ main() {
     step "6/10 注入 overlay + 软件"
     inject_overlay
     install_software
+    python3 "$SCRIPT_DIR/tools/robotd_component.py" install --source "$COMPONENT_ROOT/robotd" --root "$MNT" --lock "$COMPONENT_ROOT/components.lock.yaml"
     "$MNT/usr/local/libexec/zelux-build-pwm-overlays" "$MNT${BOOT_MNT_REL:-/boot}" "$MNT" "$SCRIPT_DIR/device-tree/overlays"
 
     step "7/10 用户 / 目录 / cloud-init / 串口 / 设备树 / 桌面"

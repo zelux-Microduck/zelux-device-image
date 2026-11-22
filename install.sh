@@ -170,6 +170,7 @@ resolve_src() {
 
 # ---------------------------------------------------------------- 打包（开发机用）
 do_pack() {
+    "${ZELUX_PYTHON:-python3}" "$SCRIPT_DIR/tools/robotd_component.py" verify --source "$COMPONENT_ROOT/robotd" --lock "$COMPONENT_ROOT/components.lock.yaml"
     [ -d "$SCRIPT_DIR/overlay" ] || die "--pack 要在镜像仓库里跑（找不到 overlay）"
     [ -d "$COMPONENT_ROOT/software/zeluxd" ] || die "缺少 components；先运行 tools/assemble-components.sh"
     VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
@@ -181,6 +182,9 @@ do_pack() {
     # Offline installs run install.sh from this archive, so include the
     # allowlisted PWM overlay compiler and its trusted DTS inputs as well.
     mkdir -p "$stage/$name/tools" "$stage/$name/device-tree"
+    cp "$SCRIPT_DIR/tools/robotd_component.py" "$stage/$name/tools/"
+    cp "$COMPONENT_ROOT/components.lock.yaml" "$stage/$name/components.lock.yaml"
+    cp -a "$COMPONENT_ROOT/robotd" "$stage/$name/robotd"
     install -m 0755 "$SCRIPT_DIR/tools/build-pwm-overlays.sh" "$stage/$name/tools/build-pwm-overlays.sh"
     cp -a "$SCRIPT_DIR/device-tree/overlays" "$stage/$name/device-tree/overlays"
     # Normalize Linux boot executables in the artifact, leaving the source checkout untouched.
@@ -213,6 +217,7 @@ check_preflight() {
     [ -d /run/systemd/system ] || die "这台机器不是 systemd 启动的（容器？），装不了服务"
     command -v systemctl >/dev/null 2>&1 || die "没有 systemctl"
     command -v rsync >/dev/null 2>&1 || die "没有 rsync：apt install rsync"
+    command -v readelf >/dev/null 2>&1 || die "robotd 依赖验证需要 readelf：apt install binutils"
 
     local arch
     arch="$(uname -m)"
@@ -251,7 +256,7 @@ record_absent() {
 
 backup_file() {
     local path="$1"
-    if [ -e "$path" ]; then
+    if [ -e "$path" ] || [ -L "$path" ]; then
         mkdir -p "$BACKUP$(dirname "$path")"
         cp -a "$path" "$BACKUP$path" || die "备份 $path 失败"
         printf 'file\t%s\n' "$path" >> "$MANIFEST"
@@ -263,7 +268,7 @@ backup_file() {
 # 只允许回滚 /etc /usr/local /opt/zelux /var/lib/zelux-fan 下的路径（防手滑）
 path_allowed() {
     case "$1" in
-        /etc/*|/usr/local/*|"$OPT_ROOT"/*|/var/lib/zelux-fan/*) return 0 ;;
+        /etc/*|/usr/local/*|"$OPT_ROOT"/*|/var/lib/zelux-fan/*|/opt/robot/daemon/current|/usr/lib/sysusers.d/zelux-robot.conf) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -287,7 +292,9 @@ do_rollback() {
                 fi
                 ;;
             absent)
-                [ -f "$path" ] && rm -f -- "$path" && log "已删除新增文件 $path"
+                if [ -f "$path" ] || [ -L "$path" ]; then
+                    rm -f -- "$path" && log "已删除新增文件 $path"
+                fi
                 ;;
             *)
                 warn "清单里有不认识的类型：$kind"
@@ -314,7 +321,7 @@ install_files() {
     local rel
     step "备份将被覆盖的文件"
     mkdir -p "$BACKUP" "$BACKUP_ROOT"
-    : > "$MANIFEST"
+    touch "$MANIFEST"
     chmod 700 "$BACKUP_ROOT" "$BACKUP" 2>/dev/null || true
 
     # overlay 里所有文件 + 单元文件，逐个记进清单
@@ -379,7 +386,7 @@ install_files() {
         "$SRC_SOFTWARE/" "$rel_dir/software/"
     if [ -d "$SRC_ROOT/device-tree/overlays" ] && [ -f /boot/armbianEnv.txt ]; then
         command -v dtc >/dev/null 2>&1 || die "设备树配置需要 dtc；请先安装 device-tree-compiler"
-        /usr/local/libexec/zelux-build-pwm-overlays /boot /usr "$SRC_ROOT/device-tree/overlays"
+        /usr/local/libexec/zelux-build-pwm-overlays /boot / "$SRC_ROOT/device-tree/overlays"
     fi
     if [ ! -d "$rel_dir/software/web" ]; then
         mkdir -p "$rel_dir/software/web"
@@ -596,6 +603,27 @@ main() {
         die "已取消"
     fi
 
+    # Initialize the shared manifest before recording robotd backup entries.
+    mkdir -p "$BACKUP" "$BACKUP_ROOT"
+    : > "$MANIFEST"
+    chmod 700 "$BACKUP_ROOT" "$BACKUP" 2>/dev/null || true
+
+    local robot_source="$COMPONENT_ROOT/robotd" robot_lock="$COMPONENT_ROOT/components.lock.yaml"
+    if [ -d "$SRC_ROOT/robotd" ]; then
+        robot_source="$SRC_ROOT/robotd"
+        robot_lock="$SRC_ROOT/components.lock.yaml"
+    fi
+    python3 "$SCRIPT_DIR/tools/robotd_component.py" verify --source "$robot_source" --lock "$robot_lock"
+    if systemctl is-active --quiet robotd.service; then
+        die "robotd 正在运行；请先通过现有流程安全停机并停止 robotd.service，再安装（不会自动停机或发运动指令）"
+    fi
+    backup_file /opt/robot/daemon/current
+    backup_file /etc/systemd/system/robotd.service
+    backup_file /etc/systemd/system/robotd.service.d/20-zelux-runtime.conf
+    backup_file /usr/local/bin/robotctl
+    backup_file /etc/robot/robotd.toml
+    backup_file /usr/lib/sysusers.d/zelux-robot.conf
+    python3 "$SCRIPT_DIR/tools/robotd_component.py" install --source "$robot_source" --root / --lock "$robot_lock"
     install_files
     apply_perms
     ensure_user

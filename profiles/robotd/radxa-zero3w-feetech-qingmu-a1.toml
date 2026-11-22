@@ -1,0 +1,11 @@
+# Initial configuration only; installers never overwrite existing /etc/robot.
+# This hardware profile is specifically for Feetech STS + qingmu-a1.
+[bus]
+port = "/dev/ttyS2"
+protocol = "feetech-sts"
+
+[bus.imu]
+source = "imu-dxl"
+model = "qingmu-a1"
+socket = "/run/zelux/robotd-imu.sock"
+max_age_ms = 100

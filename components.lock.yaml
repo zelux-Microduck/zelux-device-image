@@ -1,8 +1,10 @@
 schema: zelux.components-lock/v1
 image: 1.0.0
-protocol: 1.1.0
-studio: 1.2.0
-agent: 1.3.0
-drivers: 1.1.0
-motiond: external
-fan: local-snapshot
+protocol: 1.7.0
+studio: 1.3.0
+agent: 1.6.0
+drivers: 1.4.0
+# Independently cross-built robotd delivery; no robotd source is owned here.
+fan: 1.2.0
+robotd: 0.15.0+servo.v38.20261122
+robotd_manifest_sha256: afc7da5c93fd708ab0ce0b079642bd316140d0b058b08b4c5fc570ba83c64fcf
